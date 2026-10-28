@@ -1,0 +1,22 @@
+{
+  "name": "kassi-mcp-scanner",
+  "version": "0.1.0",
+  "description": "Static security scanner for MCP (Model Context Protocol) servers: tool-argument taint into dangerous sinks.",
+  "type": "module",
+  "bin": { "mcp-scan": "dist/cli.js" },
+  "scripts": {
+    "build": "tsc",
+    "test": "tsx --test test/*.test.ts",
+    "scan": "tsx src/cli.ts"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "acorn": "^8.14.0",
+    "acorn-walk": "^8.3.4",
+    "typescript": "^5.7.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2"
+  }
+}
