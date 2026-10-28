@@ -258,3 +258,60 @@ test("LangChain JS: new DynamicStructuredTool({ func }) handler", () => {
     const t = new DynamicStructuredTool({ name: "read", description: "read a file", func: async (input) => fs.readFile(input.path) });`, "agent.ts");
   assert.deepEqual(f.map((x) => x.id), ["path-traversal"]);
 });
+
+// ---- class-based tool handlers (extends ToolBase + execute) ----------------
+
+test("class tool: execute() arg -> exec (MongoDB-MCP-style base-class pattern)", () => {
+  // file imports nothing from a recognized SDK; the gate admits it via `*mcp*` module + extends *Tool
+  const f = scanSource(`
+    import type { ToolArgs } from "@acme/mcp-core";
+    import cp from "node:child_process";
+    export class DumpTool extends ToolBase {
+      name = "dump";
+      protected async execute({ db, path }) { return cp.execSync("mongodump --db " + db + " --out " + path); }
+    }`, "dumpTool.ts");
+  assert.deepEqual(f.map((x) => x.id), ["cmd-injection"]);
+  assert.equal(f[0].severity, "HIGH");
+});
+
+test("class tool: destructured execute arg -> fs path (via *ToolBase subclass)", () => {
+  const f = scanSource(`
+    import { MongoDBToolBase } from "@mongodb-js/mcp-core";
+    import fs from "node:fs/promises";
+    export class ReadFileTool extends MongoDBToolBase {
+      async execute({ file }) { return fs.readFile(file, "utf8"); }
+    }`, "readFileTool.ts");
+  assert.deepEqual(f.map((x) => x.id), ["path-traversal"]);
+});
+
+test("class tool: whole-arg access (args.x) still tainted", () => {
+  const f = scanSource(`
+    import { ToolBase } from "@foo/mcp";
+    import fs from "node:fs/promises";
+    export class T extends ToolBase {
+      async execute(args, context) { return fs.readFile(args.target); }
+    }`, "t.ts");
+  assert.deepEqual(f.map((x) => x.id), ["path-traversal"]);
+});
+
+test("class tool: guard-by-throw on the arg clears it (hardened server)", () => {
+  const f = scanSource(`
+    import { ToolBase } from "@foo/mcp-core";
+    import cp from "node:child_process";
+    export class SafeTool extends ToolBase {
+      async execute({ name }) {
+        if (!/^[a-z0-9_]+$/.test(name)) throw new Error("bad name");
+        return cp.execSync("echo " + name);
+      }
+    }`, "safe.ts");
+  assert.deepEqual(f.map((x) => x.id), [], "content-validating bouncer clears the tainted arg");
+});
+
+test("class tool: a non-tool class is NOT scanned (gate stays conservative)", () => {
+  const f = scanSource(`
+    import cp from "node:child_process";
+    export class Widget extends Component {
+      render({ cmd }) { return cp.execSync(cmd); }
+    }`, "widget.tsx");
+  assert.deepEqual(f.map((x) => x.id), [], "extends Component, not a *Tool base — not an MCP file");
+});

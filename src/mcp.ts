@@ -18,9 +18,22 @@ export interface Handler {
   line?: number;
 }
 
-/** Only scan AI tool servers: the file must pull in a known framework. */
+/** A class tool: `class XTool extends ToolBase { async execute(args) {…} }`. Many MCP servers (e.g.
+ *  the MongoDB MCP server via `@mongodb-js/mcp-core`, CrewAI-style wrappers) register tools by
+ *  subclassing a base and overriding an execute-like method instead of calling `server.tool(...)`.
+ *  The execute method's first param carries the model/client-controlled tool args = the taint source. */
+const EXECUTE_METHOD = /^(execute|_run|run|invoke|call|handle|handler|perform|_execute|runTool)$/;
+
+/** Only scan AI tool servers: the file must pull in a known framework, import from an `*mcp*` module,
+ *  or declare a class-based tool (subclass of a `*Tool`/`*ToolBase` base with an execute-like method). */
 export function isMcpFile(source: string): boolean {
-  return /@modelcontextprotocol\/sdk|\bMcpServer\b|\bCallToolRequestSchema\b|\bReadResourceRequestSchema\b|@langchain\/|\bDynamic(Structured)?Tool\b|from\s+["']llamaindex["']|\bFunctionTool\b|\bfastmcp\b|from\s+["']ai["']|@ai-sdk\/|\blanggraph\b/i.test(source);
+  if (/@modelcontextprotocol\/sdk|\bMcpServer\b|\bCallToolRequestSchema\b|\bReadResourceRequestSchema\b|@langchain\/|\bDynamic(Structured)?Tool\b|from\s+["']llamaindex["']|\bFunctionTool\b|\bfastmcp\b|from\s+["']ai["']|@ai-sdk\/|\blanggraph\b/i.test(source)) return true;
+  // an import whose module specifier contains "mcp" (@mongodb-js/mcp-core, mcp-core, @foo/mcp-server, …)
+  if (/\b(?:import|require)\b[^;\n]*["'][^"']*mcp[^"']*["']/i.test(source)) return true;
+  // a class-based tool: `class … extends …Tool(Base)` AND an execute-like method in the same file
+  if (/\bclass\s+\w+[^{]*\bextends\s+[\w.]*Tool(?:Base)?\b/.test(source) &&
+      /\b(?:execute|_run|invoke|handler|_execute|runTool)\s*\(/.test(source)) return true;
+  return false;
 }
 
 // request schemas whose handler receives attacker input worth tainting
@@ -60,6 +73,28 @@ function stringsIn(nodes: Node[]): string[] {
     });
   }
   return out;
+}
+
+/** Register a class-based tool handler: a class extending a `*Tool`/`*ToolBase` base, whose
+ *  execute-like method takes the tool args as its first param. */
+function classTool(node: Node, out: Handler[]): void {
+  const sup = node.superClass;
+  const supName = sup?.type === "Identifier" ? sup.name : memberName(sup);
+  if (!supName || !/(?:^|\.)\w*Tool(?:Base)?$/.test(supName)) return;
+  const members: Node[] = node.body?.body ?? [];
+  const method = members.find((m) => m?.type === "MethodDefinition" && !m.computed && m.kind !== "constructor" &&
+    EXECUTE_METHOD.test(m.key?.name ?? "") && (m.value?.type === "FunctionExpression" || m.value?.type === "ArrowFunctionExpression"));
+  if (!method) return;
+  const fn = method.value;
+  let label = node.id?.name ?? "(class tool)";
+  const metaStrings: string[] = [];
+  for (const m of members) {
+    if (m?.type !== "PropertyDefinition" || m.computed) continue;
+    const k = m.key?.name ?? m.key?.value;
+    if ((k === "name" || k === "toolName") && m.value?.type === "Literal" && typeof m.value.value === "string") label = m.value.value;
+    if ((k === "name" || k === "toolName" || k === "description" || k === "title" || k === "annotations") && m.value) metaStrings.push(...stringsIn([m.value]));
+  }
+  out.push({ kind: "tool", fn, sources: paramNames(fn.params?.[0]), label, metaStrings, line: (method.loc ?? node.loc)?.start.line });
 }
 
 /** Find every handler and the tainted source names + registration metadata strings in it. */
@@ -105,6 +140,10 @@ export function findHandlers(ast: Node): Handler[] {
         out.push({ kind: "request", fn, sources: paramNames(fn.params?.[0]), label: schema, metaStrings: [], line: n.loc?.start.line });
       }
     },
+    // Subclass tools: `class XTool extends ToolBase { async execute({a,b}) {…} }`. The execute-like
+    // method's first param is the model/client-controlled tool args (taint source).
+    ClassDeclaration(n: any) { classTool(n, out); },
+    ClassExpression(n: any) { classTool(n, out); },
     // LangChain/LlamaIndex class tools: new DynamicStructuredTool({ func, name, description, schema })
     NewExpression(n: any) {
       const name = n.callee?.type === "Identifier" ? n.callee.name : memberName(n.callee);
