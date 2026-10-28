@@ -175,6 +175,22 @@ function isConcatOrTemplate(n: Node | undefined): boolean {
   return !!n && (n.type === "TemplateLiteral" || (n.type === "BinaryExpression" && n.operator === "+"));
 }
 
+/** Names assigned from a template/concat that interpolates tainted data — i.e. a SQL string BUILT from
+ *  tool input and stored in a variable before `query(sql)`. This catches the variable case (the inline
+ *  `query(`…${x}`)` is caught directly) and, crucially, does NOT include a value passed straight through
+ *  as a param (`query(sql, params)` where sql is the user's own raw SQL) — that is by-design arbitrary SQL. */
+function strBuiltFromTaint(fn: Node, taint: Set<string>): Set<string> {
+  const built = new Set<string>();
+  const check = (name: string | undefined, init: Node | undefined) => {
+    if (name && isConcatOrTemplate(init) && refsTaint(init, taint)) built.add(name);
+  };
+  walk.simple(fn as any, {
+    VariableDeclarator(n: any) { if (n.id?.type === "Identifier") check(n.id.name, n.init); },
+    AssignmentExpression(n: any) { if (n.left?.type === "Identifier") check(n.left.name, n.right); },
+  });
+  return built;
+}
+
 interface Ctx {
   idx: Map<string, IndexedFn[]>;
   out: Finding[];
@@ -186,8 +202,11 @@ function analyzeFn(fn: Node, seed: string[], file: string, ctx: Ctx, depth: numb
   if (!fn || visited.has(fn) || depth > MAX_DEPTH) return;
   visited.add(fn);
   const taint = taintOf(fn, seed);
+  const sqlBuilt = strBuiltFromTaint(fn, taint);
   const where = ctx.label + (via ? ` (via ${via})` : "");
   const tainted = (node: Node | undefined) => node && !isSanitized(node) && refsTaint(node, taint);
+  // a SQL arg is injectable if it's an inline template/concat of taint, or a var built that way
+  const sqlInterp = (a: Node | undefined) => isConcatOrTemplate(a) || (a?.type === "Identifier" && sqlBuilt.has(a.name));
 
   const emit = (id: string, cwe: string, severity: Severity, title: string, detail: string, line?: number) =>
     ctx.out.push({ id, cwe, severity, title: `${title} in MCP ${where}`, detail, file, line, handler: where });
@@ -223,7 +242,7 @@ function analyzeFn(fn: Node, seed: string[], file: string, ctx: Ctx, depth: numb
           `Attacker-influenced MCP input is in the body/options of \`${full || bare}(...)\` (data egress, not URL control). Confirm the destination is trusted.`, n.loc?.start.line);
       }
 
-      if (SQL_METHOD.test(prop) && SQL_OBJ.test(obj) && isConcatOrTemplate(args[0]) && tainted(args[0]))
+      if (SQL_METHOD.test(prop) && SQL_OBJ.test(obj) && sqlInterp(args[0]) && tainted(args[0]))
         emit("sql-injection", "CWE-89", "HIGH", "Tool input is interpolated into a raw SQL query",
           `Attacker-influenced MCP input is concatenated/templated into \`${full}(...)\` instead of a parameterized query — SQL injection. Use bound parameters.`, n.loc?.start.line);
 

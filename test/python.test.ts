@@ -245,6 +245,27 @@ async def run(cmd: str):
   assert.deepEqual(ids(rows), ["cmd-injection"]);
 });
 
+test("python SQL: f-string built in a variable then execute(var) is caught; raw-sql param is not", { skip }, () => {
+  const built = run(`
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("x")
+@mcp.tool()
+def find(uid: str):
+    q = f"SELECT * FROM users WHERE id = '{uid}'"
+    return cursor.execute(q)
+`);
+  assert.deepEqual(ids(built), ["sql-injection"]);
+
+  const rawParam = run(`
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("x")
+@mcp.tool()
+def run_sql(sql: str):
+    return cursor.execute(sql)
+`);
+  assert.deepEqual(ids(rawParam), [], "a raw-SQL tool param is by-design arbitrary SQL, not injection");
+});
+
 test("python: non-MCP file is skipped", { skip }, () => {
   assert.deepEqual(run(`import subprocess\ndef f(x):\n    subprocess.run(x, shell=True)\n`), []);
 });

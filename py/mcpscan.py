@@ -247,11 +247,23 @@ def raw_sql_arg(a):
     return isinstance(a, ast.JoinedStr) or (isinstance(a, ast.BinOp) and isinstance(a.op, (ast.Mod, ast.Add)))
 
 
+def sql_built_from_taint(fn, taint):
+    """Names assigned a SQL string BUILT from tool input (f-string / % / +), then passed to execute(var).
+    Excludes a value handed straight through as the raw sql param (by-design arbitrary SQL)."""
+    built = set()
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Assign) and raw_sql_arg(n.value) and refs_taint(n.value, taint):
+            for t in n.targets:
+                built |= {x.id for x in ast.walk(t) if isinstance(x, ast.Name)}
+    return built
+
+
 def analyze_fn(fn, seed, file, ctx, depth, visited, via):
     if not fn or id(fn) in visited or depth > MAX_DEPTH:
         return
     visited.add(id(fn))
     taint = taint_of(fn, seed)
+    sql_built = sql_built_from_taint(fn, taint)
     label = ctx["label"] + (f" (via {via})" if via else "")
     where = f"MCP {label}"
     out = ctx["out"]
@@ -288,7 +300,8 @@ def analyze_fn(fn, seed, file, ctx, depth, visited, via):
                     emit("ssrf", "CWE-918", "MEDIUM", "Tool input is sent in an outbound request body",
                          f"Attacker-influenced MCP input is in the body/params of `{name}(...)` (data egress, not URL control).", n.lineno)
 
-            if SQL.search(name) and args and raw_sql_arg(args[0]) and refs_taint(args[0], taint):
+            sql_interp = args and (raw_sql_arg(args[0]) or (isinstance(args[0], ast.Name) and args[0].id in sql_built))
+            if SQL.search(name) and sql_interp and refs_taint(args[0], taint):
                 emit("sql-injection", "CWE-89", "HIGH", "Tool input is interpolated into a raw SQL query",
                      f"Attacker-influenced MCP input is f-string/%/+ interpolated into `{name}(...)` instead of bound parameters — SQL injection.", n.lineno)
 

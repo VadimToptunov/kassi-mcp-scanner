@@ -54,6 +54,23 @@ test("SQL injection: template-interpolated tainted query (but parameterized is s
   assert.deepEqual(ids(safe), [], "parameterized query is not flagged");
 });
 
+test("SQL injection: query string BUILT in a variable then passed to query(var) is caught", () => {
+  const f = mcp(`
+    server.tool("find", { id: z.string() }, async (args) => {
+      const q = \`SELECT * FROM users WHERE id = '\${args.id}'\`;
+      return await db.query(q);
+    });`);
+  assert.deepEqual(f.map((x) => x.id), ["sql-injection"]);
+});
+
+test("SQL: a raw-SQL tool param passed straight to query(sql) is NOT flagged (by-design arbitrary SQL)", () => {
+  const f = mcp(`
+    server.tool("run_sql", { sql: z.string(), params: z.array(z.any()) }, async (args) => {
+      return await db.query(args.sql, args.params);
+    });`);
+  assert.deepEqual(f.map((x) => x.id), [], "user-supplied raw SQL is the tool's purpose, not an injection");
+});
+
 test("taint flows through aliasing and string ops", () => {
   const f = mcp(`
     import cp from "node:child_process";
