@@ -10,7 +10,7 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { type Finding, type Severity, scanSource } from "./detect.js";
+import { type Finding, type Severity, scanProject } from "./detect.js";
 
 const SRC_RE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|py)$/;
 const SKIP = new Set(["node_modules", "dist", ".git", "build", "coverage", "out", "venv", ".venv", "__pycache__"]);
@@ -55,14 +55,16 @@ function main(): void {
 
   const files = walkFiles(path.resolve(target));
   const findings: Finding[] = [];
-  let scanned = 0;
+  // TS/JS: one project pass so cross-function resolution spans the whole repo (not per file).
+  const jsFiles: Array<{ file: string; source: string }> = [];
   for (const f of files) {
     let src: string;
     try { src = fs.readFileSync(f, "utf8"); } catch { continue; }
-    const fileFindings = f.endsWith(".py") ? scanPython(f, src) : scanSource(src, f);
-    if (fileFindings.length) scanned++;
-    findings.push(...fileFindings);
+    if (f.endsWith(".py")) findings.push(...scanPython(f, src));
+    else jsFiles.push({ file: f, source: src });
   }
+  findings.push(...scanProject(jsFiles));
+  const scanned = new Set(findings.map((x) => x.file)).size;
   const kept = findings.filter((x) => RANK[x.severity] >= RANK[min]).sort((a, b) => RANK[b.severity] - RANK[a.severity]);
 
   if (json) { console.log(JSON.stringify(kept, null, 2)); return; }

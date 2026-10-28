@@ -27,7 +27,7 @@ export function isMcpFile(source: string): boolean {
 const INPUT_SCHEMA = /^(CallTool|ReadResource|GetPrompt|Complete)RequestSchema$/;
 
 /** Local names bound by a handler parameter (Identifier, or destructured ObjectPattern w/ rename). */
-function paramNames(param: Node | undefined): string[] {
+export function paramNames(param: Node | undefined): string[] {
   if (!param) return [];
   if (param.type === "AssignmentPattern") return paramNames(param.left); // default value
   if (param.type === "Identifier") return [param.name];

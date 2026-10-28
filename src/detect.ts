@@ -1,30 +1,36 @@
-// Taint the MCP handler's input parameter(s) through the handler body and flag dangerous sinks.
+// Taint the MCP/AI handler's input parameter(s) through the handler body and flag dangerous sinks.
 // Source = attacker-influenced tool/resource/prompt input (see mcp.ts). Static (AST) only.
+//
+// Cross-function resolution: real servers register a thin wrapper that FORWARDS the tool args to a
+// service-layer function (often in another file), e.g.
+//     server.registerTool(name, schema, (params) => getFigmaDataTool.handler(params, svc, …))
+// so the sink is one call away from the taint source. We index every function across the project
+// (incl. object methods `const X = { handler: fn }` -> "X.handler"), and when a tainted argument is
+// forwarded into a resolvable function we recurse into it, mapping the forwarded args to its params
+// (bounded depth, visited-set for cycles). Without this the scanner reports false-clean on most servers.
 
 import * as walk from "acorn-walk";
 import { type Node, memberName, parse } from "./analyze.js";
-import { type Handler, findHandlers, isMcpFile } from "./mcp.js";
+import { type Handler, findHandlers, isMcpFile, paramNames } from "./mcp.js";
 
 export type Severity = "HIGH" | "MEDIUM" | "LOW";
 
 export interface Finding {
-  id: string; // cmd-injection | code-exec | path-traversal | ssrf | sql-injection
+  id: string;
   cwe: string;
   severity: Severity;
   title: string;
   detail: string;
   file: string;
   line?: number;
-  handler: string; // e.g. tool "run_shell"
+  handler: string;
 }
 
 const SANITIZER = /sanitiz|escape|allowlist|whitelist|validate|isAllowed|assert|zod|schema\.parse/i;
-
-// Tool-poisoning / prompt-injection hidden in a tool's own description or schema docs: a malicious
-// (or rug-pulled) MCP server covertly instructs the model. The AI-native MCP attack class.
 const INJECTION = /ignore\s+(?:all\s+|the\s+)?(?:previous|above|prior)\s+(?:instructions|context|messages)|disregard\s+(?:the\s+)?(?:previous|above|prior)|do\s+not\s+(?:tell|inform|mention|notify|reveal).{0,20}\buser\b|without\s+(?:telling|informing|notifying|alerting).{0,20}\buser\b|exfiltrat|<important>|<secret>|\bsystem\s+prompt\b|you\s+must\s+(?:always|secretly|silently)|send\s+(?:the\s+|all\s+|any\s+)?(?:data|files?|contents?|credentials?|secrets?|keys?|\.env)\b|read\s+(?:the\s+)?(?:~\/\.ssh|\.env|id_rsa|credentials)/i;
-// invisible payloads: zero-width / bidi overrides / unicode tag chars (used to hide instructions)
 const INVISIBLE = /[​-‏‪-‮⁠-⁤﻿]|[\u{e0000}-\u{e007f}]/u;
+
+const MAX_DEPTH = 4; // handler -> service -> … forward chain
 
 // ---- taint -----------------------------------------------------------------
 
@@ -40,20 +46,18 @@ function unwrapAwait(node: Node | undefined): Node | undefined {
 }
 
 function isSanitized(node: Node | undefined): boolean {
-  const n = unwrapAwait(node); // `await validatePath(p)` — the guard is often async
+  const n = unwrapAwait(node);
   if (!n || n.type !== "CallExpression") return false;
   const name = memberName(n.callee) || (n.callee?.type === "Identifier" ? n.callee.name : "");
   return SANITIZER.test(name);
 }
 
-/** path.basename(x) / a resolve-against-allowed-root validator strip traversal — treat as neutralized. */
 function stripsTraversal(node: Node | undefined): boolean {
   const n = unwrapAwait(node);
   if (!n || n.type !== "CallExpression") return false;
   return /(^|\.)basename$/.test(memberName(n.callee));
 }
 
-/** Build the set of tainted local names inside one handler (fixpoint over aliasing). */
 function taintOf(fn: Node, sources: string[]): Set<string> {
   const taint = new Set<string>(sources);
   for (let pass = 0; pass < 6; pass++) {
@@ -69,6 +73,55 @@ function taintOf(fn: Node, sources: string[]): Set<string> {
     if (taint.size === before) break;
   }
   return taint;
+}
+
+// ---- project function index (for cross-function resolution) ----------------
+
+interface IndexedFn { fn: Node; file: string; }
+
+/** name / "Obj.method" -> function node(s). Ambiguous names (>1) are left unresolved to avoid FPs. */
+function buildIndex(parsed: Array<{ file: string; ast: Node }>): Map<string, IndexedFn[]> {
+  const idx = new Map<string, IndexedFn[]>();
+  const add = (key: string, fn: Node, file: string) => {
+    if (!key || !fn) return;
+    const list = idx.get(key) ?? [];
+    list.push({ fn, file });
+    idx.set(key, list);
+  };
+  const isFn = (n: Node | undefined) => n && (n.type === "ArrowFunctionExpression" || n.type === "FunctionExpression");
+  for (const { file, ast } of parsed) {
+    walk.simple(ast as any, {
+      FunctionDeclaration(n: any) { if (n.id?.name) add(n.id.name, n, file); },
+      VariableDeclarator(n: any) {
+        if (n.id?.type !== "Identifier" || !n.init) return;
+        if (isFn(n.init)) add(n.id.name, n.init, file);
+        else if (n.init.type === "ObjectExpression") {
+          for (const p of n.init.properties ?? []) {
+            const k = p.key?.name ?? p.key?.value;
+            if (typeof k === "string" && isFn(p.value)) add(`${n.id.name}.${k}`, p.value, file);
+          }
+        }
+      },
+      MethodDefinition(n: any) { // class methods: X.method via the enclosing class name is hard; index bare method name
+        if (n.key?.name && isFn(n.value)) add(n.key.name, n.value, file);
+      },
+    });
+  }
+  return idx;
+}
+
+/** Resolve a call's callee to a unique indexed function (dotted name > property name > identifier). */
+function resolveCall(callee: Node, idx: Map<string, IndexedFn[]>): IndexedFn | null {
+  const keys: string[] = [];
+  const dotted = memberName(callee);
+  if (dotted) keys.push(dotted);
+  if (callee?.type === "MemberExpression" && !callee.computed && callee.property?.name) keys.push(callee.property.name);
+  if (callee?.type === "Identifier") keys.push(callee.name);
+  for (const k of keys) {
+    const hit = idx.get(k);
+    if (hit && hit.length === 1) return hit[0]; // unique only — ambiguous names skipped
+  }
+  return null;
 }
 
 // ---- sinks -----------------------------------------------------------------
@@ -87,30 +140,24 @@ function isConcatOrTemplate(n: Node | undefined): boolean {
   return !!n && (n.type === "TemplateLiteral" || (n.type === "BinaryExpression" && n.operator === "+"));
 }
 
-/** Scan one handler body for tainted sinks. */
-function scanHandler(h: Handler, file: string, out: Finding[]): void {
-  const taint = taintOf(h.fn, h.sources);
-  const where = `${h.kind} "${h.label}"`;
+interface Ctx {
+  idx: Map<string, IndexedFn[]>;
+  out: Finding[];
+  label: string; // handler label for attribution
+}
+
+/** Analyze one function with a taint seed; emit sinks and recurse into forwarded functions. */
+function analyzeFn(fn: Node, seed: string[], file: string, ctx: Ctx, depth: number, visited: Set<Node>, via: string): void {
+  if (!fn || visited.has(fn) || depth > MAX_DEPTH) return;
+  visited.add(fn);
+  const taint = taintOf(fn, seed);
+  const where = ctx.label + (via ? ` (via ${via})` : "");
   const tainted = (node: Node | undefined) => node && !isSanitized(node) && refsTaint(node, taint);
 
   const emit = (id: string, cwe: string, severity: Severity, title: string, detail: string, line?: number) =>
-    out.push({ id, cwe, severity, title: `${title} in MCP ${where}`, detail, file, line, handler: where });
+    ctx.out.push({ id, cwe, severity, title: `${title} in MCP ${where}`, detail, file, line, handler: where });
 
-  // tool-poisoning: injection text or invisible chars hidden in the tool's description/schema docs.
-  for (const s of h.metaStrings) {
-    if (INVISIBLE.test(s)) {
-      emit("tool-poisoning", "CWE-94", "HIGH", "Hidden (invisible-unicode) text in the tool description",
-        `The ${where} registration contains zero-width / bidi / unicode-tag characters — a channel for instructions the human reviewer can't see but the model reads (tool poisoning / rug-pull).`, h.line);
-      break;
-    }
-    if (INJECTION.test(s)) {
-      emit("tool-poisoning", "CWE-94", "HIGH", "Prompt-injection instructions in the tool description",
-        `The ${where} description/schema contains model-directed instructions (e.g. "${s.slice(0, 60).replace(/\s+/g, " ")}…") — a malicious or rug-pulled server covertly steering the client model.`, h.line);
-      break;
-    }
-  }
-
-  walk.simple(h.fn as any, {
+  walk.simple(fn as any, {
     CallExpression(n: any) {
       const callee = n.callee;
       const args: Node[] = n.arguments ?? [];
@@ -119,28 +166,21 @@ function scanHandler(h: Handler, file: string, out: Finding[]): void {
       const prop = callee?.type === "MemberExpression" ? (callee.property?.name ?? "") : "";
       const obj = callee?.type === "MemberExpression" ? memberName(callee.object) : "";
 
-      // command injection: child_process / execa / shell
       const isCp = CP_BARE.test(bare) || (CP_METHOD.test(prop) && CP_OBJ.test(obj));
-      if (isCp && args.some((a) => tainted(a))) {
+      if (isCp && args.some((a) => tainted(a)))
         emit("cmd-injection", "CWE-78", "HIGH", "Tool input reaches a shell/command execution sink",
           `Attacker-influenced MCP input flows into \`${full || bare}(...)\`. A malicious tool call can inject OS commands. Use execFile with a fixed binary + array args, never a shell string.`, n.loc?.start.line);
-      }
 
-      // code execution
-      if ((bare === "eval" || bare === "Function" || /(^|\.)(runInNewContext|runInContext|compileFunction)$/.test(full)) && args.some((a) => tainted(a))) {
+      if ((bare === "eval" || bare === "Function" || /(^|\.)(runInNewContext|runInContext|compileFunction)$/.test(full)) && args.some((a) => tainted(a)))
         emit("code-exec", "CWE-94", "HIGH", "Tool input reaches a code-execution sink",
           `Attacker-influenced MCP input flows into \`${full || bare}(...)\` — arbitrary code execution in the server process.`, n.loc?.start.line);
-      }
 
-      // path traversal: fs read/write with a tainted path (unless basename-stripped)
       const isFs = FS_METHOD.test(prop) && FS_OBJ.test(obj);
-      if (isFs && args[0] && !stripsTraversal(args[0]) && tainted(args[0])) {
+      if (isFs && args[0] && !stripsTraversal(args[0]) && tainted(args[0]))
         emit("path-traversal", "CWE-22", "HIGH", "Tool input reaches a filesystem path sink",
           `Attacker-influenced MCP input is used as the path in \`${full}(...)\` with no traversal guard — a crafted \`../\` reads/writes arbitrary files. Resolve against a fixed root and reject paths that escape it.`, n.loc?.start.line);
-      }
 
-      // SSRF: tainted URL into an HTTP client
-      const isNet = bare === "fetch" || (bare === "axios") || (NET_METHOD.test(prop) && NET_OBJ.test(obj)) || /(^|\.)fetch$/.test(full);
+      const isNet = bare === "fetch" || bare === "axios" || (NET_METHOD.test(prop) && NET_OBJ.test(obj)) || /(^|\.)fetch$/.test(full);
       if (isNet && args[0]) {
         if (tainted(args[0])) emit("ssrf", "CWE-918", "HIGH", "Tool input controls an outbound request URL",
           `Attacker-influenced MCP input is the URL of \`${full || bare}(...)\` — SSRF: the attacker picks the destination (internal metadata endpoints, localhost services). Allowlist hosts.`, n.loc?.start.line);
@@ -148,50 +188,84 @@ function scanHandler(h: Handler, file: string, out: Finding[]): void {
           `Attacker-influenced MCP input is in the body/options of \`${full || bare}(...)\` (data egress, not URL control). Confirm the destination is trusted.`, n.loc?.start.line);
       }
 
-      // SQL injection: tainted value interpolated into a raw query string (not a param placeholder)
-      if (SQL_METHOD.test(prop) && SQL_OBJ.test(obj) && isConcatOrTemplate(args[0]) && tainted(args[0])) {
+      if (SQL_METHOD.test(prop) && SQL_OBJ.test(obj) && isConcatOrTemplate(args[0]) && tainted(args[0]))
         emit("sql-injection", "CWE-89", "HIGH", "Tool input is interpolated into a raw SQL query",
           `Attacker-influenced MCP input is concatenated/templated into \`${full}(...)\` instead of a parameterized query — SQL injection. Use bound parameters.`, n.loc?.start.line);
+
+      // cross-function forward: a tainted arg handed to a resolvable function -> follow it.
+      // but NOT into a guard/validator (validatePath/sanitize/…): its internals legitimately
+      // handle the raw path (realpath/readdir) — following in would re-flag the guard itself.
+      const resolved = isSanitized(n) ? null : resolveCall(callee, ctx.idx);
+      if (resolved && !visited.has(resolved.fn)) {
+        const params: Node[] = resolved.fn.params ?? [];
+        const nextSeed = new Set<string>();
+        args.forEach((a, i) => {
+          if (!tainted(a)) return;
+          const p = params[i] ?? params.find((pp) => pp?.type === "RestElement");
+          for (const nm of paramNames(p)) nextSeed.add(nm);
+        });
+        if (nextSeed.size) analyzeFn(resolved.fn, [...nextSeed], resolved.file, ctx, depth + 1, visited, via ? `${via} -> ${full || bare}` : (full || bare));
       }
     },
     TaggedTemplateExpression(n: any) {
-      // execa / zx shell tags: $`cmd ${taint}`, sh`…`, execa`…`
       const tag = n.tag?.type === "Identifier" ? n.tag.name : memberName(n.tag);
-      if (/^\$$/.test(tag) || /(^|\.)(execa|zx|sh|\$)$/.test(tag)) {
-        if ((n.quasi?.expressions ?? []).some((e: Node) => refsTaint(e, taint))) {
-          emit("cmd-injection", "CWE-78", "HIGH", "Tool input reaches a shell/command execution sink",
-            `Attacker-influenced MCP input is interpolated into a shell template \`${tag}\`...\`\` — a malicious tool call can inject OS commands.`, n.loc?.start.line);
-        }
-      }
+      if ((/^\$$/.test(tag) || /(^|\.)(execa|zx|sh|\$)$/.test(tag)) && (n.quasi?.expressions ?? []).some((e: Node) => refsTaint(e, taint)))
+        emit("cmd-injection", "CWE-78", "HIGH", "Tool input reaches a shell/command execution sink",
+          `Attacker-influenced MCP input is interpolated into a shell template \`${tag}\`...\`\` — a malicious tool call can inject OS commands.`, n.loc?.start.line);
     },
     NewExpression(n: any) {
-      if (/(^|\.)Script$/.test(memberName(n.callee)) && (n.arguments ?? []).some((a: Node) => a && refsTaint(a, taint))) {
-        out.push({ id: "code-exec", cwe: "CWE-94", severity: "HIGH", title: `Tool input reaches a code-execution sink in MCP ${where}`,
-          detail: `Attacker-influenced MCP input flows into \`new vm.Script(...)\` — arbitrary code execution.`, file, line: n.loc?.start.line, handler: where });
-      }
+      if (/(^|\.)Script$/.test(memberName(n.callee)) && (n.arguments ?? []).some((a: Node) => a && refsTaint(a, taint)))
+        emit("code-exec", "CWE-94", "HIGH", "Tool input reaches a code-execution sink",
+          `Attacker-influenced MCP input flows into \`new vm.Script(...)\` — arbitrary code execution.`, n.loc?.start.line);
     },
   });
 
-  // secret exposure: the WHOLE `process.env` object used (dumped/returned/serialized), not a single
-  // `process.env.API_KEY` read. A tool that hands the environment back to the client leaks every secret.
-  walk.ancestor(h.fn as any, {
-    MemberExpression(node: any, _state: unknown, ancestors: any[]) {
+  // secret exposure: the WHOLE process.env object (not a single process.env.X read)
+  walk.ancestor(fn as any, {
+    MemberExpression(node: any, _s: unknown, ancestors: any[]) {
       if (node.computed || node.object?.type !== "Identifier" || node.object.name !== "process" || node.property?.name !== "env") return;
       const parent = ancestors[ancestors.length - 2];
-      // skip `process.env.SPECIFIC` (parent is a member access whose object is this node)
       if (parent && parent.type === "MemberExpression" && parent.object === node && !parent.computed) return;
       emit("secret-exposure", "CWE-200", "MEDIUM", "Whole `process.env` is used (secret exposure risk)",
-        `The ${where} uses the entire \`process.env\` object (not a single named var). If it is returned, serialized, or sent, every environment secret (API keys, tokens) leaks to the client. Return only the specific values you mean to.`, node.loc?.start.line);
+        `The ${where} uses the entire \`process.env\` object (not a single named var). If it is returned, serialized, or sent, every environment secret leaks to the client. Return only the specific values you mean to.`, node.loc?.start.line);
     },
   });
 }
 
-/** Scan one source file. Returns [] for non-MCP files. */
+// ---- entry points ----------------------------------------------------------
+
+/** Scan a whole project: parse all files for the cross-function index, then analyze MCP handlers. */
+export function scanProject(files: Array<{ file: string; source: string }>): Finding[] {
+  const parsed: Array<{ file: string; source: string; ast: Node }> = [];
+  for (const f of files) {
+    const ast = parse(f.source, f.file);
+    if (ast) parsed.push({ file: f.file, source: f.source, ast });
+  }
+  const idx = buildIndex(parsed);
+  const out: Finding[] = [];
+  for (const { file, source, ast } of parsed) {
+    if (!isMcpFile(source)) continue;
+    for (const h of findHandlers(ast)) {
+      const ctx: Ctx = { idx, out, label: `${h.kind} "${h.label}"` };
+      // tool-poisoning: injection text / invisible unicode in the registration metadata
+      for (const s of h.metaStrings) {
+        if (INVISIBLE.test(s)) { out.push(poison(file, h, `contains zero-width / bidi / unicode-tag characters — a channel for instructions the human reviewer can't see but the model reads (tool poisoning / rug-pull).`)); break; }
+        if (INJECTION.test(s)) { out.push(poison(file, h, `contains model-directed instructions (e.g. "${s.slice(0, 60).replace(/\s+/g, " ")}…") — a malicious or rug-pulled server covertly steering the client model.`)); break; }
+      }
+      analyzeFn(h.fn, h.sources, file, ctx, 0, new Set<Node>(), "");
+    }
+  }
+  return out;
+}
+
+function poison(file: string, h: Handler, why: string): Finding {
+  return { id: "tool-poisoning", cwe: "CWE-94", severity: "HIGH",
+    title: `Prompt-injection / hidden text in the tool description in MCP ${h.kind} "${h.label}"`,
+    detail: `The ${h.kind} "${h.label}" description/schema ${why}`, file, line: h.line, handler: `${h.kind} "${h.label}"` };
+}
+
+/** Scan one source file (cross-function resolution limited to that file). */
 export function scanSource(source: string, file = "input.ts"): Finding[] {
   if (!isMcpFile(source)) return [];
-  const ast = parse(source, file);
-  if (!ast) return [];
-  const out: Finding[] = [];
-  for (const h of findHandlers(ast)) scanHandler(h, file, out);
-  return out;
+  return scanProject([{ file, source }]);
 }

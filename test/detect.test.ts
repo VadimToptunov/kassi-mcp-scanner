@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type Finding, scanSource } from "../src/detect.js";
+import { type Finding, scanProject, scanSource } from "../src/detect.js";
 
 // every snippet is a real MCP file (imports the SDK) so the file-gate passes
 const mcp = (body: string) =>
@@ -131,6 +131,70 @@ test("LangChain JS: tool(func, cfg) handler — func arg is the tainted source",
     import cp from "node:child_process";
     const run = tool(async (input) => cp.execSync(input.cmd), { name: "run", description: "run", schema: s });`, "agent.ts");
   assert.deepEqual(f.map((x) => x.id), ["cmd-injection"]);
+});
+
+test("cross-function: handler forwards tainted params to a local function with the sink", () => {
+  const f = mcp(`
+    import cp from "node:child_process";
+    function doInstall(opts) { cp.execSync("npm i " + opts.pkg); }
+    server.tool("install", { pkg: z.string() }, async (args) => { doInstall(args); });`);
+  assert.deepEqual(f.map((x) => x.id), ["cmd-injection"]);
+  assert.match(f[0].handler, /via doInstall/);
+});
+
+test("cross-function: Figma-shape object-method forward (params -> X.handler -> fetch)", () => {
+  const f = mcp(`
+    const getFigmaDataTool = {
+      name: "get_figma_data",
+      handler: async (params, svc) => { return await fetch(params.url); },
+    };
+    server.registerTool("get_figma_data", { url: z.string() }, (params, extra) => getFigmaDataTool.handler(params, svc));`);
+  assert.ok(f.some((x) => x.id === "ssrf"), "taint followed through getFigmaDataTool.handler");
+  assert.match(f.find((x) => x.id === "ssrf")!.handler, /via .*handler/);
+});
+
+test("cross-FILE: forward resolves into a function defined in another file", () => {
+  const server = `
+    import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+    import { runTool } from "./service.js";
+    server.tool("run", { cmd: z.string() }, async (args) => runTool(args));`;
+  const service = `
+    import cp from "node:child_process";
+    export function runTool(input) { return cp.exec(input.cmd); }`;
+  const f = scanProject([{ file: "server.ts", source: server }, { file: "service.ts", source: service }]);
+  assert.deepEqual(f.map((x) => x.id), ["cmd-injection"]);
+  assert.equal(f[0].file, "service.ts", "finding points at the file with the sink");
+});
+
+test("cross-function: an ambiguous function name (2 defs) is NOT followed (avoids FP)", () => {
+  const f = mcp(`
+    import cp from "node:child_process";
+    const a = { handler: (p) => cp.execSync(p.x) };
+    const b = { handler: (p) => doSafeThing(p.x) };
+    server.tool("t", async (args) => handler(args));`);
+  // bare `handler(args)` is ambiguous (a.handler / b.handler both index under "handler") -> unresolved
+  assert.deepEqual(f.map((x) => x.id), []);
+});
+
+test("cross-function: taint is NOT followed INTO a guard/validator (no filesystem-lib FP)", () => {
+  // the whole point of validatePath is to realpath/readdir the raw path; following taint in would
+  // re-flag the guard's own internals (the servers/filesystem lib.ts false positives).
+  const f = mcp(`
+    import fs from "node:fs/promises";
+    async function validatePath(p, roots) { const rp = await fs.realpath(p); return rp; }
+    server.tool("read", { path: z.string() }, async (args) => {
+      const vp = await validatePath(args.path, roots);
+      return { content: [{ type: "text", text: await fs.readFile(vp, "utf8") }] };
+    });`);
+  assert.deepEqual(f.map((x) => x.id), [], "guard internals are not a sink; validated result is clean");
+});
+
+test("cross-function: no infinite loop on mutual recursion", () => {
+  const f = mcp(`
+    function ping(x) { return pong(x); }
+    function pong(x) { return ping(x); }
+    server.tool("t", async (args) => ping(args));`);
+  assert.deepEqual(f.map((x) => x.id), [], "recursion terminates, no sink");
 });
 
 test("LangChain JS: new DynamicStructuredTool({ func }) handler", () => {
