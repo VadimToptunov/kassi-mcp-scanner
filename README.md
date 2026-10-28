@@ -57,6 +57,11 @@ with a notice (the TS/JS scan is unaffected).
   tainted argument through resolvable forwards (bounded depth, cycle-safe, ambiguous names skipped, and
   it does **not** descend into guard/validator functions). Verified on `apify-mcp-server`: a 3-hop
   `readResource → readApiResource → sendApifyApiRequest` SSRF chain was resolved.
+- **Guard-by-throw:** a bouncer check that content-validates the input and then exits — `if
+  (!isApifyApiUri(uri)) throw`, `if (!p.startsWith(base)) return`, `if (host not in ALLOW) raise` —
+  clears that value downstream (TS and Python). A bare presence/null check (`if (!cmd) throw`) does not,
+  so real injection is still caught. This removed the apify-mcp-server SSRF false positive (it has a
+  strict Apify-origin allowlist gate).
 - A taint-based lead generator: a HIGH finding means attacker-controlled tool input reaches a dangerous
   sink with no guard the scanner could see. Confirm exploitability (and the server's real trust model —
   some MCP servers are meant to run only locally for one user) by hand before reporting.

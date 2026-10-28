@@ -71,6 +71,42 @@ def strips_traversal(node):
     return isinstance(node, ast.Call) and dotted(node.func).endswith("basename")
 
 
+VALIDATOR_METHODS = {"startswith", "endswith", "match", "search", "fullmatch"}
+
+
+def _body_bounces(body):
+    for s in body:
+        if isinstance(s, (ast.Raise, ast.Return)):
+            return True
+        if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call) and dotted(s.value.func).split(".")[-1] in ("exit", "_exit"):
+            return True
+    return False
+
+
+def guard_validated(fn, taint):
+    """Names CONTENT-validated by a bouncer guard: `if not is_api_uri(u): raise`,
+    `if not u.startswith(b): return`, `if '..' in p: raise`, `if host not in ALLOW: raise`.
+    Bare presence/None checks don't count (clearing them would miss real injection)."""
+    validated = set()
+
+    def add(node):
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name) and n.id in taint:
+                validated.add(n.id)
+
+    for n in ast.walk(fn):
+        if isinstance(n, ast.If) and _body_bounces(n.body):
+            for sub in ast.walk(n.test):
+                if isinstance(sub, ast.Call):
+                    for a in sub.args:
+                        add(a)
+                    if isinstance(sub.func, ast.Attribute) and sub.func.attr in VALIDATOR_METHODS:
+                        add(sub.func.value)
+                elif isinstance(sub, ast.Compare) and any(isinstance(op, (ast.In, ast.NotIn)) for op in sub.ops):
+                    add(sub)  # membership / allowlist check (not `is None`)
+    return validated
+
+
 def taint_of(fn, sources):
     taint = set(sources)
     for _ in range(6):
@@ -83,6 +119,7 @@ def taint_of(fn, sources):
                 taint |= names_in(n.target)
         if len(taint) == before:
             break
+    taint -= guard_validated(fn, taint)  # guard-by-throw clears content-validated names
     return taint
 
 

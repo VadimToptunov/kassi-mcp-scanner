@@ -95,6 +95,44 @@ async def read_file(path: str):
   assert.deepEqual(ids(rows), [], "validate_path(...) neutralizes traversal even behind await");
 });
 
+test("python guard-by-throw: predicate/membership clears; bare presence does not", { skip }, () => {
+  const ssrfOk = run(`
+from mcp.server.fastmcp import FastMCP
+import requests
+mcp = FastMCP("x")
+@mcp.tool()
+def read(uri: str):
+    if not is_apify_api_uri(uri):
+        raise ValueError("bad origin")
+    return requests.get(uri).text
+`);
+  assert.deepEqual(ids(ssrfOk), [], "origin predicate guard clears the url");
+
+  const memberOk = run(`
+from mcp.server.fastmcp import FastMCP
+import requests
+mcp = FastMCP("x")
+@mcp.tool()
+def read(host: str):
+    if host not in ALLOWED_HOSTS:
+        raise ValueError("bad host")
+    return requests.get(host).text
+`);
+  assert.deepEqual(ids(memberOk), [], "membership allowlist guard clears the host");
+
+  const stillVuln = run(`
+from mcp.server.fastmcp import FastMCP
+import subprocess
+mcp = FastMCP("x")
+@mcp.tool()
+def run_cmd(cmd: str):
+    if not cmd:
+        raise ValueError("cmd required")
+    return subprocess.run(cmd, shell=True)
+`);
+  assert.deepEqual(ids(stillVuln), ["cmd-injection"], "presence check is not content validation");
+});
+
 test("python: non-MCP file is skipped", { skip }, () => {
   assert.deepEqual(run(`import subprocess\ndef f(x):\n    subprocess.run(x, shell=True)\n`), []);
 });

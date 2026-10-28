@@ -58,6 +58,39 @@ function stripsTraversal(node: Node | undefined): boolean {
   return /(^|\.)basename$/.test(memberName(n.callee));
 }
 
+/** Does this statement guarantee the path exits (throw / return / process.exit)? */
+function bounces(node: Node | undefined): boolean {
+  if (!node) return false;
+  if (node.type === "ThrowStatement" || node.type === "ReturnStatement") return true;
+  if (node.type === "BlockStatement") return (node.body ?? []).some(bounces);
+  if (node.type === "ExpressionStatement") return /(^|\.)exit$/.test(memberName(node.expression?.callee));
+  return false;
+}
+
+/** Names CONTENT-validated by a bouncer guard: `if (!isApifyApiUri(uri)) throw`, `if (!x.startsWith(B))
+ *  return`, `if (RE.test(x)) throw`, `if (!allow.has(host)) throw`. A bare presence/null check does NOT
+ *  count (clearing it would miss real injection). Flow-insensitive, like the sanitizer-wrapper handling. */
+const VALIDATOR_METHOD = /^(startsWith|endsWith|includes|match|test|has|search|indexOf|every|some)$/;
+function guardValidatedNames(fn: Node, taint: Set<string>): Set<string> {
+  const validated = new Set<string>();
+  const addNames = (node: Node | undefined) => {
+    if (!node) return;
+    walk.simple(node as any, { Identifier(x: any) { if (taint.has(x.name)) validated.add(x.name); } });
+  };
+  walk.simple(fn as any, {
+    IfStatement(n: any) {
+      if (!bounces(n.consequent)) return;
+      walk.simple(n.test as any, {
+        CallExpression(c: any) {
+          for (const a of c.arguments ?? []) addNames(a); // predicate(x) / allow.has(x) / RE.test(x)
+          if (c.callee?.type === "MemberExpression" && VALIDATOR_METHOD.test(c.callee.property?.name ?? "")) addNames(c.callee.object); // x.startsWith(B)
+        },
+      });
+    },
+  });
+  return validated;
+}
+
 function taintOf(fn: Node, sources: string[]): Set<string> {
   const taint = new Set<string>(sources);
   for (let pass = 0; pass < 6; pass++) {
@@ -72,6 +105,8 @@ function taintOf(fn: Node, sources: string[]): Set<string> {
     });
     if (taint.size === before) break;
   }
+  // a bouncer guard that content-validates a tainted value clears it downstream (guard-by-throw)
+  for (const v of guardValidatedNames(fn, taint)) taint.delete(v);
   return taint;
 }
 

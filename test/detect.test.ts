@@ -189,6 +189,35 @@ test("cross-function: taint is NOT followed INTO a guard/validator (no filesyste
   assert.deepEqual(f.map((x) => x.id), [], "guard internals are not a sink; validated result is clean");
 });
 
+test("guard-by-throw: a bouncer origin-check clears the value (apify SSRF FP killed)", () => {
+  const f = mcp(`
+    server.tool("read", { uri: z.string() }, async (args) => {
+      if (!isApifyApiUri(args.uri)) throw new Error("bad origin");
+      return await fetch(args.uri);
+    });`);
+  assert.deepEqual(f.map((x) => x.id), [], "origin-validated-then-throw clears the URL");
+});
+
+test("guard-by-throw: startsWith / includes content checks clear the value", () => {
+  const ok = mcp(`
+    import fs from "node:fs/promises";
+    server.tool("read", { path: z.string() }, async (args) => {
+      if (!args.path.startsWith(BASE)) return { content: [] };
+      return { content: [{ type: "text", text: await fs.readFile(args.path, "utf8") }] };
+    });`);
+  assert.deepEqual(ok.map((x) => x.id), []);
+});
+
+test("guard-by-throw: a bare PRESENCE check does NOT clear taint (no false-negative)", () => {
+  const f = mcp(`
+    import cp from "node:child_process";
+    server.tool("run", { cmd: z.string() }, async (args) => {
+      if (!args.cmd) throw new Error("cmd required");
+      cp.execSync(args.cmd);
+    });`);
+  assert.deepEqual(f.map((x) => x.id), ["cmd-injection"], "presence check is not content validation");
+});
+
 test("cross-function: no infinite loop on mutual recursion", () => {
   const f = mcp(`
     function ping(x) { return pong(x); }
