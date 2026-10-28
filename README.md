@@ -28,9 +28,11 @@ Docker needed.
 
 **Handlers recognized** — MCP: `server.tool`/`registerTool`/`prompt`, `resource`/`registerResource`,
 `setRequestHandler(CallTool|ReadResource|GetPrompt|Complete)`, FastMCP `@mcp.tool()`/`@mcp.resource()`,
-low-level `@server.call_tool()`; agents: LangChain `tool(fn, …)` / `new DynamicStructuredTool({func})` /
-`@tool`, LlamaIndex `FunctionTool`. Only files that import one of these frameworks are scanned, so
-unrelated `.tool()`/`.exec()` calls aren't touched.
+low-level `@server.call_tool()`, and FastAPI routes exposed via `fastapi-mcp`. Agent frameworks: LangChain
+`tool(fn, …)` / `new DynamicStructuredTool({func})` / `@tool`, LlamaIndex `FunctionTool`, Vercel AI SDK
+`tool({ execute })`, CrewAI `BaseTool._run`/`_arun`, AutoGen `@register_for_execution`/`register_function`.
+Only files that import one of these frameworks are scanned, so unrelated `.tool()`/`.exec()` calls aren't
+touched.
 
 `tool-poisoning` is the AI-native class: a malicious or rug-pulled server can hide instructions the
 human reviewer never sees but the client model obeys (zero-width / bidi / unicode-tag characters, or

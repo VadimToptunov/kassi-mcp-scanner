@@ -20,7 +20,7 @@ export interface Handler {
 
 /** Only scan AI tool servers: the file must pull in a known framework. */
 export function isMcpFile(source: string): boolean {
-  return /@modelcontextprotocol\/sdk|\bMcpServer\b|\bCallToolRequestSchema\b|\bReadResourceRequestSchema\b|@langchain\/|\bDynamic(Structured)?Tool\b|from\s+["']llamaindex["']|\bFunctionTool\b|\bfastmcp\b/i.test(source);
+  return /@modelcontextprotocol\/sdk|\bMcpServer\b|\bCallToolRequestSchema\b|\bReadResourceRequestSchema\b|@langchain\/|\bDynamic(Structured)?Tool\b|from\s+["']llamaindex["']|\bFunctionTool\b|\bfastmcp\b|from\s+["']ai["']|@ai-sdk\/|\blanggraph\b/i.test(source);
 }
 
 // request schemas whose handler receives attacker input worth tainting
@@ -73,10 +73,14 @@ export function findHandlers(ast: Node): Handler[] {
       const args: Node[] = n.arguments ?? [];
       const fn = lastFnArg(args);
 
-      // LangChain JS: tool(func, { name, description, schema }) — func is the FIRST arg.
+      // tool(...) as a bare call: LangChain `tool(func, cfg)` (func first) OR Vercel AI SDK
+      // `tool({ description, parameters, execute })` (execute is the handler, args = LLM input).
       if (callee?.type === "Identifier" && callee.name === "tool") {
         const f = args.find((a) => a?.type === "ArrowFunctionExpression" || a?.type === "FunctionExpression");
-        if (f) out.push({ kind: "tool", fn: f, sources: paramNames(f.params?.[0]), label: labelOf(args), metaStrings: stringsIn(nonFnArgs(args, f)), line: n.loc?.start.line });
+        if (f) { out.push({ kind: "tool", fn: f, sources: paramNames(f.params?.[0]), label: labelOf(args), metaStrings: stringsIn(nonFnArgs(args, f)), line: n.loc?.start.line }); return; }
+        const cfg = args.find((a) => a?.type === "ObjectExpression");
+        const ex = cfg?.properties?.find((p: Node) => (p.key?.name ?? p.key?.value) === "execute" && (p.value?.type === "ArrowFunctionExpression" || p.value?.type === "FunctionExpression"));
+        if (ex) out.push({ kind: "tool", fn: ex.value, sources: paramNames(ex.value.params?.[0]), label: labelOf(args), metaStrings: stringsIn([cfg]), line: n.loc?.start.line });
         return;
       }
 

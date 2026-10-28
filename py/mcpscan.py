@@ -46,7 +46,13 @@ def dotted(node):
 
 
 def is_mcp_file(src):
-    return re.search(r"\b(mcp|fastmcp|modelcontextprotocol)\b|fastapi[_-]?mcp|FastApiMCP|langchain|llama_index|llama-index", src, re.I) is not None
+    return re.search(r"\b(mcp|fastmcp|modelcontextprotocol)\b|fastapi[_-]?mcp|FastApiMCP|langchain|llama_index|llama-index|\bcrewai\b|\b(py)?autogen\b|\blanggraph\b", src, re.I) is not None
+
+
+# CrewAI / LangChain class tools: `class X(BaseTool): def _run(self, query): …` — _run/_arun is the handler.
+BASE_TOOL = re.compile(r"(^|\.)(BaseTool|StructuredTool|Tool)$")
+# AutoGen: a function registered for the LLM to call is a tool handler.
+AUTOGEN_DECO = {"register_function", "register_for_execution"}
 
 
 # FastAPI routes exposed as MCP tools via `fastapi-mcp` (FastApiMCP(app)) — the route function params
@@ -179,7 +185,7 @@ def meta_strings(fn):
     return out
 
 
-def is_handler(fn, allow_fastapi=False):
+def is_handler(fn, allow_fastapi=False, allow_autogen=False):
     for d in fn.decorator_list:
         name = dotted(d)
         last = name.split(".")[-1] if name else ""
@@ -187,6 +193,9 @@ def is_handler(fn, allow_fastapi=False):
             return last
         # FastAPI route exposed as an MCP tool (only when the project uses fastapi-mcp)
         if allow_fastapi and isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr in FASTAPI_METHODS:
+            return "tool"
+        # AutoGen function registered for the LLM to call
+        if allow_autogen and last in AUTOGEN_DECO:
             return "tool"
     return None
 
@@ -379,31 +388,42 @@ def scan_project(path):
             continue
     idx = build_index([(f, t) for f, t, _ in parsed])
     fastapi_mcp = any(re.search(r"fastapi[_-]?mcp|FastApiMCP", s) for _, _, s in parsed)
+    autogen = any(re.search(r"\b(py)?autogen\b", s) for _, _, s in parsed)
     out = []
+
+    def run_handler(node, file, idx, out, kindhint=None):
+        kind = kindhint or is_handler(node, allow_fastapi=fastapi_mcp, allow_autogen=autogen)
+        if not kind:
+            return
+        k = "resource" if "resource" in kind else ("prompt" if "prompt" in kind else "tool")
+        label = f'{k} "{node.name}"'
+        for s in meta_strings(node):
+            if INVISIBLE.search(s):
+                out.append({"id": "tool-poisoning", "cwe": "CWE-94", "severity": "HIGH",
+                            "title": f"Hidden (invisible-unicode) text in the tool description in MCP {label}",
+                            "detail": f"The {label} docstring/description contains zero-width / bidi / unicode-tag characters — a hidden channel for model instructions (tool poisoning).",
+                            "file": file, "line": node.lineno, "handler": label})
+                break
+            if INJECTION.search(s):
+                out.append({"id": "tool-poisoning", "cwe": "CWE-94", "severity": "HIGH",
+                            "title": f"Prompt-injection instructions in the tool description in MCP {label}",
+                            "detail": f'The {label} docstring/description contains model-directed instructions ("{s[:60].strip()}…") — a malicious or rug-pulled server steering the client model.',
+                            "file": file, "line": node.lineno, "handler": label})
+                break
+        analyze_fn(node, handler_sources(node, fastapi=fastapi_mcp), file, {"idx": idx, "out": out, "label": label}, 0, set(), "")
+
     for file, tree, src in parsed:
         if not is_mcp_file(src):
             continue
+        # CrewAI / LangChain class tools: a BaseTool subclass' _run / _arun method is the handler
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and any(BASE_TOOL.search(dotted(b)) for b in node.bases):
+                for m in node.body:
+                    if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and m.name in ("_run", "_arun"):
+                        run_handler(m, file, idx, out, kindhint="tool")
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                kind = is_handler(node, allow_fastapi=fastapi_mcp)
-                if not kind:
-                    continue
-                k = "resource" if "resource" in kind else ("prompt" if "prompt" in kind else "tool")
-                label = f'{k} "{node.name}"'
-                for s in meta_strings(node):
-                    if INVISIBLE.search(s):
-                        out.append({"id": "tool-poisoning", "cwe": "CWE-94", "severity": "HIGH",
-                                    "title": f"Hidden (invisible-unicode) text in the tool description in MCP {label}",
-                                    "detail": f"The {label} docstring/description contains zero-width / bidi / unicode-tag characters — a hidden channel for model instructions (tool poisoning).",
-                                    "file": file, "line": node.lineno, "handler": label})
-                        break
-                    if INJECTION.search(s):
-                        out.append({"id": "tool-poisoning", "cwe": "CWE-94", "severity": "HIGH",
-                                    "title": f"Prompt-injection instructions in the tool description in MCP {label}",
-                                    "detail": f'The {label} docstring/description contains model-directed instructions ("{s[:60].strip()}…") — a malicious or rug-pulled server steering the client model.',
-                                    "file": file, "line": node.lineno, "handler": label})
-                        break
-                analyze_fn(node, handler_sources(node, fastapi=fastapi_mcp), file, {"idx": idx, "out": out, "label": label}, 0, set(), "")
+                run_handler(node, file, idx, out)
     return out
 
 

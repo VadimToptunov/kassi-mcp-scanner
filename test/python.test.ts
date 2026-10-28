@@ -266,6 +266,33 @@ def run_sql(sql: str):
   assert.deepEqual(ids(rawParam), [], "a raw-SQL tool param is by-design arbitrary SQL, not injection");
 });
 
+test("python CrewAI: a BaseTool subclass' _run is a tool handler", { skip }, () => {
+  const rows = run(`
+from crewai.tools import BaseTool
+import subprocess
+
+class ShellTool(BaseTool):
+    name: str = "shell"
+    description: str = "run a shell command"
+    def _run(self, cmd: str) -> str:
+        return subprocess.run(cmd, shell=True)
+`);
+  assert.deepEqual(ids(rows), ["cmd-injection"]);
+});
+
+test("python AutoGen: a function registered for execution is a tool handler", { skip }, () => {
+  const rows = run(`
+import autogen
+import subprocess
+
+@user_proxy.register_for_execution()
+@assistant.register_for_llm(description="run")
+def run_cmd(cmd: str):
+    return subprocess.run(cmd, shell=True)
+`);
+  assert.deepEqual(ids(rows), ["cmd-injection"]);
+});
+
 test("python: non-MCP file is skipped", { skip }, () => {
   assert.deepEqual(run(`import subprocess\ndef f(x):\n    subprocess.run(x, shell=True)\n`), []);
 });

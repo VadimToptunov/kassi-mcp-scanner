@@ -243,6 +243,14 @@ test("cross-function: no infinite loop on mutual recursion", () => {
   assert.deepEqual(f.map((x) => x.id), [], "recursion terminates, no sink");
 });
 
+test("Vercel AI SDK: tool({ execute }) — execute's arg is the tainted source", () => {
+  const f = scanSource(`
+    import { tool } from "ai";
+    import cp from "node:child_process";
+    const run = tool({ description: "run", parameters: schema, execute: async ({ cmd }) => cp.execSync(cmd) });`, "agent.ts");
+  assert.deepEqual(f.map((x) => x.id), ["cmd-injection"]);
+});
+
 test("LangChain JS: new DynamicStructuredTool({ func }) handler", () => {
   const f = scanSource(`
     import { DynamicStructuredTool } from "@langchain/core/tools";
