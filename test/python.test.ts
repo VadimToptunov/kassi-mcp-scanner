@@ -25,6 +25,17 @@ function run(src: string): Array<{ id: string; severity: string }> {
 }
 const ids = (rows: Array<{ id: string }>) => [...new Set(rows.map((r) => r.id))].sort();
 
+/** Write several files into a temp project dir and scan the whole dir (cross-file resolution). */
+function runProject(fileMap: Record<string, string>): Array<{ id: string; handler: string; file: string }> {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcpscan-proj-"));
+  for (const [name, src] of Object.entries(fileMap)) fs.writeFileSync(path.join(dir, name), src);
+  try {
+    return JSON.parse(execFileSync("python3", ["-I", SCRIPT, dir], { encoding: "utf8" }));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 test("python FastMCP: shell + pickle + ssrf + env + poisoning, clean tool stays clean", { skip }, () => {
   const rows = run(`
 from mcp.server.fastmcp import FastMCP
@@ -131,6 +142,66 @@ def run_cmd(cmd: str):
     return subprocess.run(cmd, shell=True)
 `);
   assert.deepEqual(ids(stillVuln), ["cmd-injection"], "presence check is not content validation");
+});
+
+test("python cross-function: handler forwards tool input to a local function with the sink", { skip }, () => {
+  const rows = run(`
+from mcp.server.fastmcp import FastMCP
+import subprocess
+mcp = FastMCP("x")
+
+def do_install(opts):
+    subprocess.run(opts["pkg"], shell=True)
+
+@mcp.tool()
+def install(pkg: str):
+    do_install({"pkg": pkg})
+`);
+  assert.deepEqual(ids(rows), ["cmd-injection"]);
+  assert.match(rows[0].handler, /via do_install/);
+});
+
+test("python cross-FILE: forward resolves into a function in another module", { skip }, () => {
+  const rows = runProject({
+    "server.py": `
+from mcp.server.fastmcp import FastMCP
+from service import read_api
+mcp = FastMCP("x")
+
+@mcp.tool()
+def read(uri: str):
+    return read_api(uri)
+`,
+    "service.py": `
+import requests
+def read_api(u):
+    return requests.get(u).text
+`,
+  });
+  assert.ok(rows.some((r) => r.id === "ssrf"), "taint followed into service.read_api");
+  assert.ok(rows.some((r) => r.file.endsWith("service.py")), "finding points at the sink's file");
+});
+
+test("python cross-function: taint not followed into a guard, and ambiguous name skipped", { skip }, () => {
+  // guard: the forwarded value is validated in read_api before the request
+  const guarded = runProject({
+    "server.py": `
+from mcp.server.fastmcp import FastMCP
+from service import read_api
+mcp = FastMCP("x")
+@mcp.tool()
+def read(uri: str):
+    return read_api(uri)
+`,
+    "service.py": `
+import requests
+def read_api(u):
+    if not is_api_uri(u):
+        raise ValueError("bad")
+    return requests.get(u).text
+`,
+  });
+  assert.deepEqual(ids(guarded), [], "guard-by-throw inside the resolved function clears it");
 });
 
 test("python: non-MCP file is skipped", { skip }, () => {

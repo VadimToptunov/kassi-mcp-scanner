@@ -51,12 +51,13 @@ with a notice (the TS/JS scan is unaffected).
 
 ## Honest scope
 
-- **Cross-function / cross-file resolution:** real servers register a thin wrapper that forwards the
-  tool args to a service-layer function (often in another file). The TS scanner indexes every function
-  across the project (incl. object methods `const X = { handler: fn }` → `X.handler`) and follows a
-  tainted argument through resolvable forwards (bounded depth, cycle-safe, ambiguous names skipped, and
-  it does **not** descend into guard/validator functions). Verified on `apify-mcp-server`: a 3-hop
-  `readResource → readApiResource → sendApifyApiRequest` SSRF chain was resolved.
+- **Cross-function / cross-file resolution (TS/JS *and* Python):** real servers register a thin wrapper
+  that forwards the tool args to a service-layer function, often in another file. Both analyzers index
+  every function across the project (TS: object methods `const X = { handler: fn }` → `X.handler`;
+  Python: module functions + `Class.method`) and follow a tainted argument through resolvable forwards
+  (bounded depth, cycle-safe, ambiguous names skipped, method `self`/`cls` offset handled, and they do
+  **not** descend into guard/validator functions). The Python analyzer takes a project directory and
+  walks it for the index.
 - **Guard-by-throw:** a bouncer check that content-validates the input and then exits — `if
   (!isApifyApiUri(uri)) throw`, `if (!p.startsWith(base)) return`, `if (host not in ALLOW) raise` —
   clears that value downstream (TS and Python). A bare presence/null check (`if (!cmd) throw`) does not,
@@ -66,5 +67,5 @@ with a notice (the TS/JS scan is unaffected).
   sink with no guard the scanner could see. Confirm exploitability (and the server's real trust model —
   some MCP servers are meant to run only locally for one user) by hand before reporting.
 - Code-level data flow only; it does not model prompt-injection *semantics* beyond the tool-poisoning
-  string/unicode heuristics. Cross-function resolution is TS/JS today; the Python analyzer is still
-  intra-handler (next increment), as are more Python web clients.
+  string/unicode heuristics. Resolution is unique-name based (ambiguous names are skipped, so a very
+  generic method name shared by many classes won't be followed).

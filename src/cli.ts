@@ -22,10 +22,12 @@ const PY_SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 const PY_GATE = /\b(mcp|fastmcp|modelcontextprotocol)\b|langchain|llama_index|llama-index/i;
 let pyMissing = false;
 
-function scanPython(file: string, src: string): Finding[] {
-  if (pyMissing || !PY_GATE.test(src)) return [];
+// Python is analyzed as a whole project in one pass (the ast script walks the tree and builds the
+// cross-function index itself), so a tainted arg forwarded into a service function in another .py is followed.
+function scanPythonProject(target: string): Finding[] {
+  if (pyMissing) return [];
   try {
-    const out = execFileSync("python3", ["-I", PY_SCRIPT, file], { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
+    const out = execFileSync("python3", ["-I", PY_SCRIPT, target], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
     return JSON.parse(out) as Finding[];
   } catch (e: any) {
     if (e?.code === "ENOENT") { pyMissing = true; console.error("! python3 not found — skipping Python MCP files"); }
@@ -57,13 +59,15 @@ function main(): void {
   const findings: Finding[] = [];
   // TS/JS: one project pass so cross-function resolution spans the whole repo (not per file).
   const jsFiles: Array<{ file: string; source: string }> = [];
+  let hasMcpPy = false;
   for (const f of files) {
     let src: string;
     try { src = fs.readFileSync(f, "utf8"); } catch { continue; }
-    if (f.endsWith(".py")) findings.push(...scanPython(f, src));
+    if (f.endsWith(".py")) { if (PY_GATE.test(src)) hasMcpPy = true; }
     else jsFiles.push({ file: f, source: src });
   }
   findings.push(...scanProject(jsFiles));
+  if (hasMcpPy) findings.push(...scanPythonProject(path.resolve(target))); // one project pass over the Python tree
   const scanned = new Set(findings.map((x) => x.file)).size;
   const kept = findings.filter((x) => RANK[x.severity] >= RANK[min]).sort((a, b) => RANK[b.severity] - RANK[a.severity]);
 
