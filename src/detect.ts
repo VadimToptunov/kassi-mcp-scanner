@@ -35,16 +35,22 @@ function refsTaint(node: Node | undefined, taint: Set<string>): boolean {
   return found;
 }
 
+function unwrapAwait(node: Node | undefined): Node | undefined {
+  return node?.type === "AwaitExpression" ? node.argument : node;
+}
+
 function isSanitized(node: Node | undefined): boolean {
-  if (!node || node.type !== "CallExpression") return false;
-  const name = memberName(node.callee) || (node.callee?.type === "Identifier" ? node.callee.name : "");
+  const n = unwrapAwait(node); // `await validatePath(p)` — the guard is often async
+  if (!n || n.type !== "CallExpression") return false;
+  const name = memberName(n.callee) || (n.callee?.type === "Identifier" ? n.callee.name : "");
   return SANITIZER.test(name);
 }
 
-/** path.basename(x) / path.parse(x).base strip directory traversal — treat as neutralized. */
+/** path.basename(x) / a resolve-against-allowed-root validator strip traversal — treat as neutralized. */
 function stripsTraversal(node: Node | undefined): boolean {
-  if (!node || node.type !== "CallExpression") return false;
-  return /(^|\.)basename$/.test(memberName(node.callee));
+  const n = unwrapAwait(node);
+  if (!n || n.type !== "CallExpression") return false;
+  return /(^|\.)basename$/.test(memberName(n.callee));
 }
 
 /** Build the set of tainted local names inside one handler (fixpoint over aliasing). */

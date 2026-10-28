@@ -57,11 +57,17 @@ def refs_taint(node, taint):
 SANITIZER = re.compile(r"sanitiz|escape|allowlist|whitelist|validate|is_allowed|shlex\.quote|secure_filename", re.I)
 
 
+def _unwrap_await(node):
+    return node.value if isinstance(node, ast.Await) else node
+
+
 def is_sanitized(node):
+    node = _unwrap_await(node)  # `await validate_path(p)` — the guard is often async
     return isinstance(node, ast.Call) and bool(SANITIZER.search(dotted(node.func)))
 
 
 def strips_traversal(node):
+    node = _unwrap_await(node)
     return isinstance(node, ast.Call) and dotted(node.func).endswith("basename")
 
 

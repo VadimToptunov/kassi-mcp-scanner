@@ -82,6 +82,19 @@ def q(uid: str):
   assert.deepEqual(ids(safe), []);
 });
 
+test("python: await-wrapped validator is a guard (no path-traversal FP)", { skip }, () => {
+  const rows = run(`
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("x")
+@mcp.tool()
+async def read_file(path: str):
+    vp = await validate_path(path, allowed_dirs)
+    with open(vp) as f:
+        return f.read()
+`);
+  assert.deepEqual(ids(rows), [], "validate_path(...) neutralizes traversal even behind await");
+});
+
 test("python: non-MCP file is skipped", { skip }, () => {
   assert.deepEqual(run(`import subprocess\ndef f(x):\n    subprocess.run(x, shell=True)\n`), []);
 });
