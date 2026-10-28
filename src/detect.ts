@@ -20,6 +20,12 @@ export interface Finding {
 
 const SANITIZER = /sanitiz|escape|allowlist|whitelist|validate|isAllowed|assert|zod|schema\.parse/i;
 
+// Tool-poisoning / prompt-injection hidden in a tool's own description or schema docs: a malicious
+// (or rug-pulled) MCP server covertly instructs the model. The AI-native MCP attack class.
+const INJECTION = /ignore\s+(?:all\s+|the\s+)?(?:previous|above|prior)\s+(?:instructions|context|messages)|disregard\s+(?:the\s+)?(?:previous|above|prior)|do\s+not\s+(?:tell|inform|mention|notify|reveal).{0,20}\buser\b|without\s+(?:telling|informing|notifying|alerting).{0,20}\buser\b|exfiltrat|<important>|<secret>|\bsystem\s+prompt\b|you\s+must\s+(?:always|secretly|silently)|send\s+(?:the\s+|all\s+|any\s+)?(?:data|files?|contents?|credentials?|secrets?|keys?|\.env)\b|read\s+(?:the\s+)?(?:~\/\.ssh|\.env|id_rsa|credentials)/i;
+// invisible payloads: zero-width / bidi overrides / unicode tag chars (used to hide instructions)
+const INVISIBLE = /[​-‏‪-‮⁠-⁤﻿]|[\u{e0000}-\u{e007f}]/u;
+
 // ---- taint -----------------------------------------------------------------
 
 function refsTaint(node: Node | undefined, taint: Set<string>): boolean {
@@ -84,6 +90,20 @@ function scanHandler(h: Handler, file: string, out: Finding[]): void {
   const emit = (id: string, cwe: string, severity: Severity, title: string, detail: string, line?: number) =>
     out.push({ id, cwe, severity, title: `${title} in MCP ${where}`, detail, file, line, handler: where });
 
+  // tool-poisoning: injection text or invisible chars hidden in the tool's description/schema docs.
+  for (const s of h.metaStrings) {
+    if (INVISIBLE.test(s)) {
+      emit("tool-poisoning", "CWE-94", "HIGH", "Hidden (invisible-unicode) text in the tool description",
+        `The ${where} registration contains zero-width / bidi / unicode-tag characters — a channel for instructions the human reviewer can't see but the model reads (tool poisoning / rug-pull).`, h.line);
+      break;
+    }
+    if (INJECTION.test(s)) {
+      emit("tool-poisoning", "CWE-94", "HIGH", "Prompt-injection instructions in the tool description",
+        `The ${where} description/schema contains model-directed instructions (e.g. "${s.slice(0, 60).replace(/\s+/g, " ")}…") — a malicious or rug-pulled server covertly steering the client model.`, h.line);
+      break;
+    }
+  }
+
   walk.simple(h.fn as any, {
     CallExpression(n: any) {
       const callee = n.callee;
@@ -143,6 +163,19 @@ function scanHandler(h: Handler, file: string, out: Finding[]): void {
         out.push({ id: "code-exec", cwe: "CWE-94", severity: "HIGH", title: `Tool input reaches a code-execution sink in MCP ${where}`,
           detail: `Attacker-influenced MCP input flows into \`new vm.Script(...)\` — arbitrary code execution.`, file, line: n.loc?.start.line, handler: where });
       }
+    },
+  });
+
+  // secret exposure: the WHOLE `process.env` object used (dumped/returned/serialized), not a single
+  // `process.env.API_KEY` read. A tool that hands the environment back to the client leaks every secret.
+  walk.ancestor(h.fn as any, {
+    MemberExpression(node: any, _state: unknown, ancestors: any[]) {
+      if (node.computed || node.object?.type !== "Identifier" || node.object.name !== "process" || node.property?.name !== "env") return;
+      const parent = ancestors[ancestors.length - 2];
+      // skip `process.env.SPECIFIC` (parent is a member access whose object is this node)
+      if (parent && parent.type === "MemberExpression" && parent.object === node && !parent.computed) return;
+      emit("secret-exposure", "CWE-200", "MEDIUM", "Whole `process.env` is used (secret exposure risk)",
+        `The ${where} uses the entire \`process.env\` object (not a single named var). If it is returned, serialized, or sent, every environment secret (API keys, tokens) leaks to the client. Return only the specific values you mean to.`, node.loc?.start.line);
     },
   });
 }

@@ -6,13 +6,32 @@
 // Walks a file or directory (skipping node_modules/dist/.git), scans every TS/JS file that
 // imports the MCP SDK, and reports tool/resource/prompt input flowing into dangerous sinks.
 
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { type Finding, type Severity, scanSource } from "./detect.js";
 
-const SRC_RE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
-const SKIP = new Set(["node_modules", "dist", ".git", "build", "coverage", "out"]);
+const SRC_RE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|py)$/;
+const SKIP = new Set(["node_modules", "dist", ".git", "build", "coverage", "out", "venv", ".venv", "__pycache__"]);
 const RANK: Record<Severity, number> = { HIGH: 3, MEDIUM: 2, LOW: 1 };
+
+// Python MCP/AI servers are analyzed by the sibling ast-based script (py/mcpscan.py); the target
+// file is only parsed there, never executed. Resolve the script next to this module (src/ or dist/).
+const PY_SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../py/mcpscan.py");
+const PY_GATE = /\b(mcp|fastmcp|modelcontextprotocol)\b|langchain|llama_index|llama-index/i;
+let pyMissing = false;
+
+function scanPython(file: string, src: string): Finding[] {
+  if (pyMissing || !PY_GATE.test(src)) return [];
+  try {
+    const out = execFileSync("python3", ["-I", PY_SCRIPT, file], { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
+    return JSON.parse(out) as Finding[];
+  } catch (e: any) {
+    if (e?.code === "ENOENT") { pyMissing = true; console.error("! python3 not found — skipping Python MCP files"); }
+    return [];
+  }
+}
 
 function walkFiles(root: string, acc: string[] = []): string[] {
   let st: fs.Stats;
@@ -40,9 +59,9 @@ function main(): void {
   for (const f of files) {
     let src: string;
     try { src = fs.readFileSync(f, "utf8"); } catch { continue; }
-    const fs_findings = scanSource(src, f);
-    if (fs_findings.length) scanned++;
-    findings.push(...fs_findings);
+    const fileFindings = f.endsWith(".py") ? scanPython(f, src) : scanSource(src, f);
+    if (fileFindings.length) scanned++;
+    findings.push(...fileFindings);
   }
   const kept = findings.filter((x) => RANK[x.severity] >= RANK[min]).sort((a, b) => RANK[b.severity] - RANK[a.severity]);
 
