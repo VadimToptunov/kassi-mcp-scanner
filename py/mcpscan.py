@@ -358,10 +358,28 @@ def analyze_fn(fn, seed, file, ctx, depth, visited, via):
 def _scan_environ(fn, where, label, file, out):
     seen = set()
 
+    def mark_environ(scope):
+        for n in ast.walk(scope):
+            if isinstance(n, ast.Attribute) and n.attr == "environ" and dotted(n.value) == "os":
+                seen.add(id(n))
+
     class V(ast.NodeVisitor):
         def visit_Subscript(self, node):
+            # os.environ['X'] — reading ONE var is fine, not a dump
             if isinstance(node.value, ast.Attribute) and node.value.attr == "environ" and dotted(node.value.value) == "os":
                 seen.add(id(node.value))
+            self.generic_visit(node)
+
+        def visit_Attribute(self, node):
+            # os.environ.get("X") / .copy() / .keys() — a member access, not a whole-object dump
+            if isinstance(node.value, ast.Attribute) and node.value.attr == "environ" and dotted(node.value.value) == "os":
+                seen.add(id(node.value))
+            self.generic_visit(node)
+
+        def visit_keyword(self, node):
+            # `env=os.environ` / `env={**os.environ, ...}` passed to a subprocess is NOT a client leak
+            if node.arg == "env":
+                mark_environ(node.value)
             self.generic_visit(node)
     V().visit(fn)
     for n in ast.walk(fn):

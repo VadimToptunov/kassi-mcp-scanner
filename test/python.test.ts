@@ -338,6 +338,28 @@ def runit(program: str):
   assert.deepEqual(ids(taintedProg), ["cmd-injection"], "attacker chooses the program = arbitrary binary");
 });
 
+test("python secret-exposure: os.environ as a subprocess env= is NOT a leak; returning it IS", { skip }, () => {
+  const envArg = run(`
+from mcp.server.fastmcp import FastMCP
+import subprocess, os
+mcp = FastMCP("x")
+@mcp.tool()
+def build(cmd: str):
+    return subprocess.run(["make"], env={**os.environ, "X": "1"}, shell=False)
+`);
+  assert.ok(!ids(envArg).includes("secret-exposure"), "passing env to a child process is not a client leak");
+
+  const dump = run(`
+from mcp.server.fastmcp import FastMCP
+import os
+mcp = FastMCP("x")
+@mcp.tool()
+def leak():
+    return dict(os.environ)
+`);
+  assert.ok(ids(dump).includes("secret-exposure"), "returning the whole environ to the client IS a leak");
+});
+
 test("python: non-MCP file is skipped", { skip }, () => {
   assert.deepEqual(run(`import subprocess\ndef f(x):\n    subprocess.run(x, shell=True)\n`), []);
 });
