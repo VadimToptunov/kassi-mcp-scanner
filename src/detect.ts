@@ -191,20 +191,87 @@ function strBuiltFromTaint(fn: Node, taint: Set<string>): Set<string> {
   return built;
 }
 
+/** Ordered parts of a URL expression: a template literal or a `+`-concat chain. null if neither. */
+function urlParts(node: Node | undefined): Array<{ text?: string; expr?: Node }> | null {
+  if (!node) return null;
+  if (node.type === "TemplateLiteral") {
+    const parts: Array<{ text?: string; expr?: Node }> = [];
+    const quasis = node.quasis ?? [], exprs = node.expressions ?? [];
+    for (let i = 0; i < quasis.length; i++) {
+      parts.push({ text: quasis[i]?.value?.cooked ?? quasis[i]?.value?.raw ?? "" });
+      if (i < exprs.length) parts.push({ expr: exprs[i] });
+    }
+    return parts;
+  }
+  if (node.type === "BinaryExpression" && node.operator === "+") {
+    const flat: Node[] = [];
+    const flatten = (n: Node) => { if (n?.type === "BinaryExpression" && n.operator === "+") { flatten(n.left); flatten(n.right); } else flat.push(n); };
+    flatten(node);
+    return flat.map((n) => (n.type === "Literal" && typeof n.value === "string") ? { text: n.value } : { expr: n });
+  }
+  return null;
+}
+
+/** Where attacker taint lands in a URL expression: "host" (controls scheme/authority → real SSRF) vs
+ *  "path" (only a path/query suffix on a host fixed by a preceding literal or base-URL variable → not
+ *  host control). null = not a URL expression / no taint in it. A fixed `scheme://host/` prefix, or ANY
+ *  non-tainted expression before the first taint (a base-URL variable), closes the authority → "path". */
+function classifyUrlTaint(node: Node | undefined, taint: Set<string>): "host" | "path" | null {
+  const parts = urlParts(node);
+  if (!parts) return null;
+  let prefixText = "";
+  let sawPrecedingExpr = false;
+  for (const p of parts) {
+    if (p.expr && refsTaint(p.expr, taint)) {
+      if (sawPrecedingExpr) return "path";
+      if (/:\/\/[^/]+\//.test(prefixText)) return "path";
+      return "host";
+    }
+    if (p.text !== undefined) prefixText += p.text;
+    else if (p.expr) sawPrecedingExpr = true;
+  }
+  return null;
+}
+
+/** Names assigned from a URL expression built on a FIXED host with taint only in the path (→ not SSRF
+ *  host control). Lets `const u = `${base}${arg}`; fetch(u)` be classified at the sink. */
+function urlPathOnlyNames(fn: Node, taint: Set<string>): Set<string> {
+  const out = new Set<string>();
+  const check = (name: string | undefined, init: Node | undefined) => {
+    if (name && classifyUrlTaint(init, taint) === "path") out.add(name);
+  };
+  walk.simple(fn as any, {
+    VariableDeclarator(n: any) { if (n.id?.type === "Identifier") check(n.id.name, n.init); },
+    AssignmentExpression(n: any) { if (n.left?.type === "Identifier") check(n.left.name, n.right); },
+  });
+  return out;
+}
+
 interface Ctx {
   idx: Map<string, IndexedFn[]>;
   out: Finding[];
   label: string; // handler label for attribution
 }
 
-/** Analyze one function with a taint seed; emit sinks and recurse into forwarded functions. */
-function analyzeFn(fn: Node, seed: string[], file: string, ctx: Ctx, depth: number, visited: Set<Node>, via: string): void {
+/** Analyze one function with a taint seed; emit sinks and recurse into forwarded functions.
+ *  `seedPathOnly` names seed params whose taint is only a path suffix on a fixed host (forwarded from
+ *  a caller that built the URL) — so a downstream `fetch(param)` is path manipulation, not host SSRF. */
+function analyzeFn(fn: Node, seed: string[], file: string, ctx: Ctx, depth: number, visited: Set<Node>, via: string, seedPathOnly: string[] = []): void {
   if (!fn || visited.has(fn) || depth > MAX_DEPTH) return;
   visited.add(fn);
   const taint = taintOf(fn, seed);
   const sqlBuilt = strBuiltFromTaint(fn, taint);
+  const pathOnly = new Set<string>(seedPathOnly);
+  for (const n of urlPathOnlyNames(fn, taint)) pathOnly.add(n);
   const where = ctx.label + (via ? ` (via ${via})` : "");
   const tainted = (node: Node | undefined) => node && !isSanitized(node) && refsTaint(node, taint);
+  // classify a URL argument's taint position: "host" (real SSRF) | "path" (fixed host) | null
+  const urlClass = (a: Node | undefined): "host" | "path" | null => {
+    const direct = classifyUrlTaint(a, taint);
+    if (direct) return direct;
+    if (a?.type === "Identifier" && pathOnly.has(a.name)) return "path";
+    return tainted(a) ? "host" : null;
+  };
   // a SQL arg is injectable if it's an inline template/concat of taint, or a var built that way
   const sqlInterp = (a: Node | undefined) => isConcatOrTemplate(a) || (a?.type === "Identifier" && sqlBuilt.has(a.name));
 
@@ -236,8 +303,11 @@ function analyzeFn(fn: Node, seed: string[], file: string, ctx: Ctx, depth: numb
 
       const isNet = bare === "fetch" || bare === "axios" || (NET_METHOD.test(prop) && NET_OBJ.test(obj)) || /(^|\.)fetch$/.test(full);
       if (isNet && args[0]) {
-        if (tainted(args[0])) emit("ssrf", "CWE-918", "HIGH", "Tool input controls an outbound request URL",
+        const cls = urlClass(args[0]);
+        if (cls === "host") emit("ssrf", "CWE-918", "HIGH", "Tool input controls an outbound request URL",
           `Attacker-influenced MCP input is the URL of \`${full || bare}(...)\` — SSRF: the attacker picks the destination (internal metadata endpoints, localhost services). Allowlist hosts.`, n.loc?.start.line);
+        else if (cls === "path") emit("ssrf", "CWE-918", "MEDIUM", "Tool input is a path/query on a fixed-host URL",
+          `Attacker-influenced MCP input is interpolated into the PATH/query of \`${full || bare}(...)\`, but the host is fixed (a literal or base-URL prefix precedes it) — not host-controlled SSRF. Still worth a path-traversal/parameter-tampering check; confirm the base host and that \`../\` can't redirect it.`, n.loc?.start.line);
         else if (args.slice(1).some((a) => tainted(a))) emit("ssrf", "CWE-918", "MEDIUM", "Tool input is sent in an outbound request body",
           `Attacker-influenced MCP input is in the body/options of \`${full || bare}(...)\` (data egress, not URL control). Confirm the destination is trusted.`, n.loc?.start.line);
       }
@@ -253,12 +323,14 @@ function analyzeFn(fn: Node, seed: string[], file: string, ctx: Ctx, depth: numb
       if (resolved && !visited.has(resolved.fn)) {
         const params: Node[] = resolved.fn.params ?? [];
         const nextSeed = new Set<string>();
+        const nextPathOnly = new Set<string>();
         args.forEach((a, i) => {
           if (!tainted(a)) return;
           const p = params[i] ?? params.find((pp) => pp?.type === "RestElement");
-          for (const nm of paramNames(p)) nextSeed.add(nm);
+          const isPath = (a?.type === "Identifier" && pathOnly.has(a.name)) || classifyUrlTaint(a, taint) === "path";
+          for (const nm of paramNames(p)) { nextSeed.add(nm); if (isPath) nextPathOnly.add(nm); }
         });
-        if (nextSeed.size) analyzeFn(resolved.fn, [...nextSeed], resolved.file, ctx, depth + 1, visited, via ? `${via} -> ${full || bare}` : (full || bare));
+        if (nextSeed.size) analyzeFn(resolved.fn, [...nextSeed], resolved.file, ctx, depth + 1, visited, via ? `${via} -> ${full || bare}` : (full || bare), [...nextPathOnly]);
       }
     },
     TaggedTemplateExpression(n: any) {

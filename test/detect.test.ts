@@ -315,3 +315,34 @@ test("class tool: a non-tool class is NOT scanned (gate stays conservative)", ()
     }`, "widget.tsx");
   assert.deepEqual(f.map((x) => x.id), [], "extends Component, not a *Tool base — not an MCP file");
 });
+
+// ---- SSRF precision: host-control vs path-on-fixed-host --------------------
+
+test("SSRF: taint in URL PATH on a fixed literal host = MEDIUM (not host control)", () => {
+  const f = mcp(`server.tool("f", async (args) => { await fetch(\`https://api.example.com/v1/\${args.id}\`); });`);
+  const s = f.find((x) => x.id === "ssrf");
+  assert.equal(s?.severity, "MEDIUM", "path on a fixed host is not host-control SSRF");
+});
+
+test("SSRF: taint in the HOST position stays HIGH", () => {
+  const f = mcp(`server.tool("f", async (args) => { await fetch(\`https://\${args.host}/x\`); });`);
+  assert.equal(f.find((x) => x.id === "ssrf")?.severity, "HIGH");
+});
+
+test("SSRF: taint appended after a base-URL variable = MEDIUM", () => {
+  const f = mcp(`server.tool("f", async (args) => { const u = \`\${cfg.baseUrl}/docs/\${args.slug}.mdx\`; await fetch(u); });`);
+  assert.equal(f.find((x) => x.id === "ssrf")?.severity, "MEDIUM");
+});
+
+test("SSRF: path-on-fixed-host classification threads across a forward call = MEDIUM", () => {
+  const f = mcp(`
+    function fetchIt(u) { return fetch(u); }
+    server.tool("f", async (args) => fetchIt(\`https://host.example/api/\${args.q}\`));`);
+  const s = f.find((x) => x.id === "ssrf");
+  assert.equal(s?.severity, "MEDIUM", "classification survived the hop into fetchIt");
+});
+
+test("SSRF: whole tainted value as URL is still HIGH (regression guard)", () => {
+  const f = mcp(`server.tool("f", async (args) => { await fetch(args.url); });`);
+  assert.equal(f.find((x) => x.id === "ssrf")?.severity, "HIGH");
+});
