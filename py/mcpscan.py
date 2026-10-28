@@ -288,9 +288,21 @@ def analyze_fn(fn, seed, file, ctx, depth, visited, via):
             last = name.split(".")[-1] if name else ""
             args = list(n.args)
 
-            if (CMD.search(name) and (CMD_OBJ.search(name) or last in ("system", "popen", "getoutput", "create_subprocess_shell", "create_subprocess_exec"))) and (has_shell_true(n) or taint_arg(args, taint)):
-                emit("cmd-injection", "CWE-78", "HIGH", "Tool input reaches a shell/command sink",
-                     f"Attacker-influenced MCP input flows into `{name}(...)`" + (" with shell=True" if has_shell_true(n) else "") + ". Use a fixed argv list and never shell=True with tool input.", n.lineno)
+            if CMD.search(name) and (CMD_OBJ.search(name) or last in ("system", "popen", "getoutput", "getstatusoutput", "create_subprocess_shell", "create_subprocess_exec")):
+                # SHELL form (shell=True / os.system / os.popen / *_shell): any tainted arg = shell injection.
+                shell_form = has_shell_true(n) or last in ("system", "popen", "getoutput", "getstatusoutput", "create_subprocess_shell")
+                if shell_form and taint_arg(args, taint):
+                    emit("cmd-injection", "CWE-78", "HIGH", "Tool input reaches a shell/command sink",
+                         f"Attacker-influenced MCP input flows into `{name}(...)`" + (" with shell=True" if has_shell_true(n) else " (runs via a shell)") + ". Use a fixed argv list and never a shell with tool input.", n.lineno)
+                elif not shell_form and args:
+                    # ARGV form (list, no shell): shell metachars are inert, so a tainted ARGUMENT is not
+                    # injection. Dangerous only if the PROGRAM is attacker-chosen, and we only assert that
+                    # when it's visible: an inline list whose FIRST element is tainted. A prebuilt argv in a
+                    # variable (`cmd=[ffmpeg,...]; run(cmd)`) has a fixed program -> not flagged (vfx/pandoc FP).
+                    prog = args[0]
+                    if isinstance(prog, (ast.List, ast.Tuple)) and prog.elts and refs_taint(prog.elts[0], taint):
+                        emit("cmd-injection", "CWE-78", "HIGH", "Tool input chooses the program executed",
+                             f"Attacker-influenced MCP input is the PROGRAM in `{name}(...)` (argv form) — it runs an arbitrary binary. Pin the program; pass user data only as fixed-position arguments.", n.lineno)
 
             if last in ("eval", "exec", "compile") and not name.count(".") and taint_arg(args, taint):
                 emit("code-exec", "CWE-94", "HIGH", "Tool input reaches a code-execution sink",

@@ -293,6 +293,51 @@ def run_cmd(cmd: str):
   assert.deepEqual(ids(rows), ["cmd-injection"]);
 });
 
+test("python shell-vs-argv: argv subprocess.run with a FIXED program + tainted args is NOT cmd-injection", { skip }, () => {
+  // the vfx-mcp / pandoc false-positive class: argv list, no shell=True -> metachars are inert
+  const argvFixed = run(`
+from mcp.server.fastmcp import FastMCP
+import subprocess
+mcp = FastMCP("x")
+@mcp.tool()
+def transcode(infile: str, outfile: str):
+    return subprocess.run(["ffmpeg", "-i", infile, outfile], capture_output=True)
+`);
+  assert.deepEqual(ids(argvFixed), [], "fixed program, user data only as argv elements");
+
+  const execArgv = run(`
+from mcp.server.fastmcp import FastMCP
+import asyncio
+mcp = FastMCP("x")
+@mcp.tool()
+async def convert(fmt: str, path: str):
+    return await asyncio.create_subprocess_exec("pandoc", "-t", fmt, path)
+`);
+  assert.deepEqual(ids(execArgv), [], "create_subprocess_exec is argv, not a shell");
+});
+
+test("python shell-vs-argv: shell=True or a tainted PROGRAM IS cmd-injection", { skip }, () => {
+  const shellTrue = run(`
+from mcp.server.fastmcp import FastMCP
+import subprocess
+mcp = FastMCP("x")
+@mcp.tool()
+def grep(pattern: str):
+    return subprocess.run("grep " + pattern + " .", shell=True, capture_output=True)
+`);
+  assert.deepEqual(ids(shellTrue), ["cmd-injection"], "shell=True + tainted = injection (the fastfs class)");
+
+  const taintedProg = run(`
+from mcp.server.fastmcp import FastMCP
+import subprocess
+mcp = FastMCP("x")
+@mcp.tool()
+def runit(program: str):
+    return subprocess.run([program, "--version"])
+`);
+  assert.deepEqual(ids(taintedProg), ["cmd-injection"], "attacker chooses the program = arbitrary binary");
+});
+
 test("python: non-MCP file is skipped", { skip }, () => {
   assert.deepEqual(run(`import subprocess\ndef f(x):\n    subprocess.run(x, shell=True)\n`), []);
 });
