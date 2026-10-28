@@ -46,7 +46,13 @@ def dotted(node):
 
 
 def is_mcp_file(src):
-    return re.search(r"\b(mcp|fastmcp|modelcontextprotocol)\b|langchain|llama_index|llama-index", src, re.I) is not None
+    return re.search(r"\b(mcp|fastmcp|modelcontextprotocol)\b|fastapi[_-]?mcp|FastApiMCP|langchain|llama_index|llama-index", src, re.I) is not None
+
+
+# FastAPI routes exposed as MCP tools via `fastapi-mcp` (FastApiMCP(app)) — the route function params
+# are the attacker-controlled tool input. Only treated as handlers when the project imports fastapi-mcp.
+FASTAPI_METHODS = {"get", "post", "put", "patch", "delete", "head", "options"}
+FASTAPI_SKIP = {"request", "response", "background_tasks", "websocket", "bg"}
 
 
 def names_in(node):
@@ -133,8 +139,28 @@ def fn_params(fn):
     return [p.arg for p in ps] + [p.arg for p in a.kwonlyargs]
 
 
-def handler_sources(fn):
-    return [p for p in fn_params(fn) if p not in SKIP_PARAMS]
+def depends_params(fn):
+    """FastAPI params whose default is Depends()/Security() — injected deps, not attacker input."""
+    a = fn.args
+    pos = list(a.posonlyargs) + list(a.args)
+    out = set()
+    defaults = list(a.defaults)
+    if defaults:  # defaults align to the LAST N positional params
+        for p, d in zip(pos[len(pos) - len(defaults):], defaults):
+            if isinstance(d, ast.Call) and dotted(d.func).split(".")[-1] in ("Depends", "Security"):
+                out.add(p.arg)
+    for p, d in zip(a.kwonlyargs, a.kw_defaults):
+        if isinstance(d, ast.Call) and dotted(d.func).split(".")[-1] in ("Depends", "Security"):
+            out.add(p.arg)
+    return out
+
+
+def handler_sources(fn, fastapi=False):
+    names = [p for p in fn_params(fn) if p not in SKIP_PARAMS]
+    if fastapi:
+        dep = depends_params(fn)
+        names = [n for n in names if n not in FASTAPI_SKIP and n not in dep]
+    return names
 
 
 def meta_strings(fn):
@@ -153,12 +179,15 @@ def meta_strings(fn):
     return out
 
 
-def is_handler(fn):
+def is_handler(fn, allow_fastapi=False):
     for d in fn.decorator_list:
         name = dotted(d)
         last = name.split(".")[-1] if name else ""
         if HANDLER_DECO.search(name) or last == "tool":
             return last
+        # FastAPI route exposed as an MCP tool (only when the project uses fastapi-mcp)
+        if allow_fastapi and isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr in FASTAPI_METHODS:
+            return "tool"
     return None
 
 
@@ -197,7 +226,7 @@ def resolve_call(callee, idx):
 
 # ---- sinks -----------------------------------------------------------------
 
-CMD = re.compile(r"(?:^|\.)(system|popen|getoutput|getstatusoutput)$|(?:^|\.)(run|call|check_output|check_call|Popen)$")
+CMD = re.compile(r"(?:^|\.)(system|popen|getoutput|getstatusoutput|create_subprocess_shell|create_subprocess_exec)$|(?:^|\.)(run|call|check_output|check_call|Popen)$")
 CMD_OBJ = re.compile(r"subprocess|^os$|\bos\.|commands|^sh$|\bsh\.|pexpect")
 NET = re.compile(r"(?:^|\.)(get|post|put|patch|delete|request|urlopen|Request|send)$")
 NET_OBJ = re.compile(r"requests|httpx|urllib|aiohttp|urllib3|\bhttp\b")
@@ -238,7 +267,7 @@ def analyze_fn(fn, seed, file, ctx, depth, visited, via):
             last = name.split(".")[-1] if name else ""
             args = list(n.args)
 
-            if (CMD.search(name) and (CMD_OBJ.search(name) or last in ("system", "popen", "getoutput"))) and (has_shell_true(n) or taint_arg(args, taint)):
+            if (CMD.search(name) and (CMD_OBJ.search(name) or last in ("system", "popen", "getoutput", "create_subprocess_shell", "create_subprocess_exec"))) and (has_shell_true(n) or taint_arg(args, taint)):
                 emit("cmd-injection", "CWE-78", "HIGH", "Tool input reaches a shell/command sink",
                      f"Attacker-influenced MCP input flows into `{name}(...)`" + (" with shell=True" if has_shell_true(n) else "") + ". Use a fixed argv list and never shell=True with tool input.", n.lineno)
 
@@ -336,13 +365,14 @@ def scan_project(path):
         except SyntaxError:
             continue
     idx = build_index([(f, t) for f, t, _ in parsed])
+    fastapi_mcp = any(re.search(r"fastapi[_-]?mcp|FastApiMCP", s) for _, _, s in parsed)
     out = []
     for file, tree, src in parsed:
         if not is_mcp_file(src):
             continue
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                kind = is_handler(node)
+                kind = is_handler(node, allow_fastapi=fastapi_mcp)
                 if not kind:
                     continue
                 k = "resource" if "resource" in kind else ("prompt" if "prompt" in kind else "tool")
@@ -360,7 +390,7 @@ def scan_project(path):
                                     "detail": f'The {label} docstring/description contains model-directed instructions ("{s[:60].strip()}…") — a malicious or rug-pulled server steering the client model.',
                                     "file": file, "line": node.lineno, "handler": label})
                         break
-                analyze_fn(node, handler_sources(node), file, {"idx": idx, "out": out, "label": label}, 0, set(), "")
+                analyze_fn(node, handler_sources(node, fastapi=fastapi_mcp), file, {"idx": idx, "out": out, "label": label}, 0, set(), "")
     return out
 
 

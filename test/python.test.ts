@@ -204,6 +204,47 @@ def read_api(u):
   assert.deepEqual(ids(guarded), [], "guard-by-throw inside the resolved function clears it");
 });
 
+test("python fastapi-mcp: a FastAPI route is a tool source; Depends is excluded; plain FastAPI is not", { skip }, () => {
+  const mcpExposed = run(`
+from fastapi import FastAPI, Depends
+from fastapi_mcp import FastApiMCP
+import subprocess
+app = FastAPI()
+
+@app.post("/run")
+def run(cmd: str, db = Depends(get_db)):
+    return subprocess.run(cmd, shell=True)
+
+mcp = FastApiMCP(app)
+mcp.mount()
+`);
+  assert.deepEqual(ids(mcpExposed), ["cmd-injection"], "FastAPI route exposed via fastapi-mcp is attacker-reachable");
+
+  const plainFastapi = run(`
+from fastapi import FastAPI
+import subprocess
+app = FastAPI()
+
+@app.post("/run")
+def run(cmd: str):
+    return subprocess.run(cmd, shell=True)
+`);
+  assert.deepEqual(ids(plainFastapi), [], "plain FastAPI (no fastapi-mcp) is not an MCP server — not scanned");
+});
+
+test("python: asyncio.create_subprocess_shell with tool input is cmd-injection", { skip }, () => {
+  const rows = run(`
+from mcp.server.fastmcp import FastMCP
+import asyncio
+mcp = FastMCP("x")
+@mcp.tool()
+async def run(cmd: str):
+    proc = await asyncio.create_subprocess_shell(cmd)
+    return await proc.communicate()
+`);
+  assert.deepEqual(ids(rows), ["cmd-injection"]);
+});
+
 test("python: non-MCP file is skipped", { skip }, () => {
   assert.deepEqual(run(`import subprocess\ndef f(x):\n    subprocess.run(x, shell=True)\n`), []);
 });
