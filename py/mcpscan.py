@@ -499,8 +499,10 @@ SIZE_NAME = re.compile(r"(length|byte|size|bytes|len|total|count|received|read|a
 LIMIT_NAME = re.compile(r"(max|limit|cap|bound|threshold|quota)", re.I)
 DISPATCH_FN = re.compile(r"(handle|dispatch|process|on_?message|route|execute|serve)", re.I)
 RPC_MEMBER = {"method", "jsonrpc", "id", "params"}
-GROW_METHOD = {"append", "extend", "write", "concat"}
+GROW_METHOD = {"append", "extend", "concat"}  # NOT "write" — writing OUT drains a stream, not a read
 STREAM_ATTR = re.compile(r"(stream|iter_any|iter_content|iter_chunked|iter_chunks|__aiter__)$", re.I)
+# the iterated source of a request-body read (vs a file stream / DB cursor, out of scope)
+REQ_SOURCE = re.compile(r"(req|request|incoming|socket|body|conn|stream|receive)", re.I)
 
 
 def _is_size_side(n):
@@ -546,7 +548,9 @@ def _grows_buffer(scope):
 def _accumulates_body(fn):
     for n in ast.walk(fn):
         if isinstance(n, ast.AsyncFor) and _grows_buffer(n):  # async for chunk in request.stream()
-            return True
+            src = dotted(n.iter.func) if isinstance(n.iter, ast.Call) else dotted(n.iter)
+            if REQ_SOURCE.search(src):  # a request stream, not a file/DB async iterable
+                return True
         if isinstance(n, ast.For) and _grows_buffer(n):
             it = n.iter
             if isinstance(it, ast.Call) and STREAM_ATTR.search(dotted(it.func)):
@@ -584,11 +588,17 @@ def _has_dispatch_iteration(fn):
     return False
 
 
+# A JSON-RPC batch finding is only meaningful in JSON-RPC transport code; this gate keeps the detector
+# off unrelated isinstance(x, list) + dispatch shapes (CLI commands, batch utilities).
+RPC_FILE = re.compile(r"jsonrpc|json-rpc|JSONRPCMessage|-32700|-32600|-32603|CallToolRequest|is_initialize_request|StreamableHTTP", re.I)
+
+
 def scan_unbounded(parsed):
     out = []
     for file, tree, src in parsed:
         if not is_mcp_file(src):
             continue
+        is_rpc_file = bool(RPC_FILE.search(src))
         for fn in ast.walk(tree):
             if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -599,7 +609,7 @@ def scan_unbounded(parsed):
                             "title": "Request body is accumulated without a size cap",
                             "detail": "An HTTP transport reads and accumulates a request body (an async stream / chunk loop) with no byte/length limit enforced before it is buffered or parsed. A single large request exhausts server memory (cf. MCP SDK GHSA-f897-62hf-6gxq). Cap the accumulated size and reject once exceeded.",
                             "file": file, "line": fn.lineno, "handler": "(HTTP transport)"})
-            elif _has_isinstance_list(fn) and _has_dispatch_iteration(fn):
+            elif is_rpc_file and _has_isinstance_list(fn) and _has_dispatch_iteration(fn):
                 out.append({"id": "unbounded-batch", "cwe": "CWE-770", "severity": "HIGH",
                             "title": "JSON-RPC batch is iterated without a length cap",
                             "detail": "A JSON-RPC batch (`isinstance(message, list)` → the message list) is dispatched element-by-element with no cap on the list length before processing. A huge batch array exhausts memory/CPU (cf. MCP SDK GHSA-f897-62hf-6gxq). Reject batches longer than a fixed maximum before iterating.",

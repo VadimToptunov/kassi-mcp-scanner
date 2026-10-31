@@ -444,6 +444,7 @@ test("unbounded body NEGATIVE: a running byte-count cap clears it", () => {
 
 test("unbounded batch: Array.isArray + dispatch with no length cap is HIGH", () => {
   const f = mcp(`
+    // JSON-RPC 2.0 streamableHttp transport
     export function onMessage(parsed) {
       const messages = Array.isArray(parsed) ? parsed : [parsed];
       return messages.map((m) => handleMessage(m));
@@ -453,12 +454,22 @@ test("unbounded batch: Array.isArray + dispatch with no length cap is HIGH", () 
 
 test("unbounded batch NEGATIVE: a length cap before iterating clears it", () => {
   const f = mcp(`
+    // JSON-RPC 2.0 streamableHttp transport
     export function onMessage(parsed) {
       const messages = Array.isArray(parsed) ? parsed : [parsed];
       if (messages.length > 100) throw new Error("batch too large");
       return messages.map((m) => handleMessage(m));
     }`);
   assert.deepEqual(f.map((x) => x.id), [], "a batch-length cap makes it bounded");
+});
+
+test("unbounded batch NEGATIVE: a non-JSON-RPC Array.isArray+map (CLI/util) is NOT flagged", () => {
+  const f = mcp(`
+    export function removeAll(ids) {
+      const list = Array.isArray(ids) ? ids : [ids];
+      return list.map((id) => processDelete(id));
+    }`);
+  assert.deepEqual(f.map((x) => x.id), [], "batch finding is gated to JSON-RPC transport files");
 });
 
 test("unbounded NEGATIVE: a plain .on('data') that does not accumulate is not flagged", () => {

@@ -447,6 +447,7 @@ test("python unbounded batch: isinstance(list) + dispatch with no length cap is 
   const rows = run(`
 from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("x")
+# JSON-RPC 2.0 streamable HTTP transport
 def on_message(parsed):
     msgs = parsed if isinstance(parsed, list) else [parsed]
     for m in msgs:
@@ -459,6 +460,7 @@ test("python unbounded batch NEGATIVE: a len() cap before iterating clears it", 
   const rows = run(`
 from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("x")
+# JSON-RPC 2.0 streamable HTTP transport
 def on_message(parsed):
     msgs = parsed if isinstance(parsed, list) else [parsed]
     if len(msgs) > 100:
@@ -467,4 +469,16 @@ def on_message(parsed):
         handle_message(m)
 `);
   assert.deepEqual(ids(rows), []);
+});
+
+test("python unbounded batch NEGATIVE: a non-JSON-RPC isinstance(list)+loop (util) is NOT flagged", { skip }, () => {
+  const rows = run(`
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("x")
+def remove_all(ids):
+    items = ids if isinstance(ids, list) else [ids]
+    for i in items:
+        process_delete(i)
+`);
+  assert.deepEqual(ids(rows), [], "batch finding is gated to JSON-RPC transport files");
 });

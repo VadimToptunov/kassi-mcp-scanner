@@ -49,7 +49,11 @@ function hasSizeCap(fn: Node): boolean {
   return found;
 }
 
-const GROW_METHOD = /^(push|concat|write|append)$/;
+// `.push`/`.concat`/`.append` GROW a buffer; `.write` is the opposite (draining a stream OUT), so it
+// is deliberately excluded — a `for await (chunk of response.body) res.write(chunk)` relay is not a read.
+const GROW_METHOD = /^(push|concat|append)$/;
+// the iterated source of a request-body read (vs a file stream / DB cursor, which is out of scope)
+const REQ_SOURCE = /(^|\.)(req|request|incoming|socket|body|conn|stream|rawbody|raw)$/i;
 
 /** A statement/scope that GROWS an accumulator: `body += chunk`, `chunks.push(c)`, `buf.concat(c)`. */
 function growsBuffer(scope: Node): boolean {
@@ -77,11 +81,16 @@ function dataListenerGrows(fn: Node): boolean {
   return hit;
 }
 
-/** `for await (const chunk of req) { body += chunk }` — streaming read that accumulates. */
+/** `for await (const chunk of req) { body += chunk }` — streaming read of a REQUEST that accumulates.
+ *  The source must look like a request stream; a file stream / DB cursor is a different threat model. */
 function forAwaitGrows(fn: Node): boolean {
   let hit = false;
   walk.simple(fn as any, {
-    ForOfStatement(n: any) { if (n.await && growsBuffer(n.body)) hit = true; },
+    ForOfStatement(n: any) {
+      if (!n.await || !growsBuffer(n.body)) return;
+      const src = n.right?.type === "Identifier" ? n.right.name : memberName(n.right);
+      if (REQ_SOURCE.test(src)) hit = true;
+    },
   });
   return hit;
 }
@@ -127,6 +136,20 @@ function hasArrayIsArray(fn: Node): boolean {
   return hit;
 }
 
+// A function that opens a FILE stream is reading the local filesystem, not a remote request body —
+// a different (path-validated) trust model, so its `.on("data")` accumulation is out of scope here.
+const FILE_STREAM = /(^|\.)(createReadStream|createWriteStream|openAsBlob)$/;
+function readsFileStream(fn: Node): boolean {
+  let hit = false;
+  walk.simple(fn as any, {
+    CallExpression(n: any) {
+      const name = (n.callee?.type === "Identifier" ? n.callee.name : memberName(n.callee)) || "";
+      if (FILE_STREAM.test(name)) hit = true;
+    },
+  });
+  return hit;
+}
+
 /** All function nodes in a tree (declarations, expressions, arrows, methods). */
 function allFns(ast: Node): Node[] {
   const out: Node[] = [];
@@ -138,21 +161,27 @@ function allFns(ast: Node): Node[] {
   return out;
 }
 
+// A JSON-RPC batch finding is only meaningful in JSON-RPC transport code; this gate keeps the
+// detector off unrelated `Array.isArray(x) ? x : [x]` + `.map(process)` shapes (CLI commands, admin
+// batch utilities) that are not request-controlled message batches.
+const RPC_FILE = /jsonrpc|json-rpc|JSONRPCMessage|-32700|-32600|-32603|CallToolRequest|isInitializeRequest|StreamableHTTP/i;
+
 /** Scan already-parsed MCP files for unbounded body / batch reads. */
-export function scanUnbounded(parsed: Array<{ file: string; ast: Node }>): Finding[] {
+export function scanUnbounded(parsed: Array<{ file: string; ast: Node; source?: string }>): Finding[] {
   const out: Finding[] = [];
-  for (const { file, ast } of parsed) {
+  for (const { file, ast, source } of parsed) {
+    const isRpcFile = !source || RPC_FILE.test(source);
     for (const fn of allFns(ast)) {
       if (hasSizeCap(fn)) continue; // a cap is present somewhere in this function → bounded
       const line = fn.loc?.start.line;
-      if (dataListenerGrows(fn) || forAwaitGrows(fn)) {
+      if ((dataListenerGrows(fn) || forAwaitGrows(fn)) && !readsFileStream(fn)) {
         out.push({ id: "unbounded-body", cwe: "CWE-770", severity: "HIGH",
           title: "Request body is accumulated without a size cap",
           detail: "An HTTP transport reads and accumulates a request body (`.on(\"data\", …)` / `for await (… of req)`) with no byte/length limit enforced before it is buffered or parsed. A single large request exhausts server memory (cf. MCP TypeScript SDK GHSA-f897-62hf-6gxq). Cap the accumulated size and reject once it is exceeded (e.g. `raw-body`/`getRawBody` with a `limit`, or a running byte count checked against a maximum).",
           file, line, handler: "(HTTP transport)" });
         continue;
       }
-      if (hasArrayIsArray(fn) && hasDispatchIteration(fn)) {
+      if (isRpcFile && hasArrayIsArray(fn) && hasDispatchIteration(fn)) {
         out.push({ id: "unbounded-batch", cwe: "CWE-770", severity: "HIGH",
           title: "JSON-RPC batch is iterated without a length cap",
           detail: "A JSON-RPC batch (`Array.isArray(message)` → the message array) is dispatched element-by-element with no cap on the array length before processing. A single request carrying a huge batch array exhausts memory/CPU (cf. MCP TypeScript SDK GHSA-f897-62hf-6gxq, PR#2698/#2926). Reject batches whose length exceeds a fixed maximum before iterating.",
