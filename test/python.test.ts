@@ -363,3 +363,108 @@ def leak():
 test("python: non-MCP file is skipped", { skip }, () => {
   assert.deepEqual(run(`import subprocess\ndef f(x):\n    subprocess.run(x, shell=True)\n`), []);
 });
+
+// ---- SSRF-guard awareness (seed: mcp-sanitizer GHSA-4mfg-r38w-w8fg) --------
+
+test("python SSRF guard bypass: a loopback-only blocklist is flagged (misses ::1/0.0.0.0/mapped)", { skip }, () => {
+  const rows = run(`
+from mcp.server.fastmcp import FastMCP
+import requests
+from urllib.parse import urlparse
+mcp = FastMCP("x")
+@mcp.tool()
+def fetch_url(url: str):
+    h = urlparse(url).hostname
+    if h == "localhost" or h == "127.0.0.1":
+        raise ValueError("blocked")
+    return requests.get(url)
+`);
+  assert.deepEqual(ids(rows), ["ssrf-guard-bypass"]);
+});
+
+test("python SSRF guard COMPLETE: covering ::1/0.0.0.0/::ffff is clean (negative control)", { skip }, () => {
+  const rows = run(`
+from mcp.server.fastmcp import FastMCP
+import requests
+from urllib.parse import urlparse
+mcp = FastMCP("x")
+@mcp.tool()
+def fetch_url(url: str):
+    h = urlparse(url).hostname
+    if h in ("localhost", "127.0.0.1", "0.0.0.0", "::1") or str(h).startswith("::ffff:"):
+        raise ValueError("blocked")
+    return requests.get(url)
+`);
+  assert.deepEqual(ids(rows), [], "a guard covering the bypass forms must not fire");
+});
+
+test("python SSRF guard: an allowlist guard stays clean (no false alarm)", { skip }, () => {
+  const rows = run(`
+from mcp.server.fastmcp import FastMCP
+import requests
+mcp = FastMCP("x")
+@mcp.tool()
+def fetch_url(url: str):
+    if not is_api_uri(url):
+        raise ValueError("bad origin")
+    return requests.get(url)
+`);
+  assert.deepEqual(ids(rows), [], "allowlisting is the correct defense");
+});
+
+// ---- unbounded input / resource exhaustion (seed: MCP TS SDK GHSA-f897-62hf-6gxq) ----
+
+test("python unbounded body: async stream accumulation with no cap is flagged", { skip }, () => {
+  const rows = run(`
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("x")
+async def transport(request):
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+    return body
+`);
+  assert.deepEqual(ids(rows), ["unbounded-body"]);
+});
+
+test("python unbounded body NEGATIVE: a running size cap clears it", { skip }, () => {
+  const rows = run(`
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("x")
+async def transport(request):
+    body = b""
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > 1048576:
+            raise ValueError("too large")
+        body += chunk
+`);
+  assert.deepEqual(ids(rows), []);
+});
+
+test("python unbounded batch: isinstance(list) + dispatch with no length cap is flagged", { skip }, () => {
+  const rows = run(`
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("x")
+def on_message(parsed):
+    msgs = parsed if isinstance(parsed, list) else [parsed]
+    for m in msgs:
+        handle_message(m)
+`);
+  assert.deepEqual(ids(rows), ["unbounded-batch"]);
+});
+
+test("python unbounded batch NEGATIVE: a len() cap before iterating clears it", { skip }, () => {
+  const rows = run(`
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("x")
+def on_message(parsed):
+    msgs = parsed if isinstance(parsed, list) else [parsed]
+    if len(msgs) > 100:
+        raise ValueError("batch too large")
+    for m in msgs:
+        handle_message(m)
+`);
+  assert.deepEqual(ids(rows), []);
+});

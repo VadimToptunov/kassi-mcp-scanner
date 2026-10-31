@@ -120,7 +120,8 @@ def guard_validated(fn, taint):
     return validated
 
 
-def taint_of(fn, sources):
+def propagate(fn, sources):
+    """Raw taint reachability, WITHOUT guard-clearing."""
     taint = set(sources)
     for _ in range(6):
         before = len(taint)
@@ -132,8 +133,101 @@ def taint_of(fn, sources):
                 taint |= names_in(n.target)
         if len(taint) == before:
             break
+    return taint
+
+
+def taint_of(fn, sources):
+    taint = propagate(fn, sources)
     taint -= guard_validated(fn, taint)
     return taint
+
+
+# ---- SSRF-guard awareness (seed: mcp-sanitizer GHSA-4mfg-r38w-w8fg) --------
+# A private-network/loopback BLOCKLIST guard is only as good as the forms it rejects; the bypass
+# class is IPv6 loopback (::1), IPv4-mapped (::ffff:127.0.0.1), 0.0.0.0, encoded IPs, and failing to
+# re-check after a redirect. A guard that names loopback/private but MISSES those is a live SSRF; an
+# ALLOWLIST guard (host in {...} / host == "api...") is the correct defense and must stay clean.
+SSRF_BLOCKLIST = re.compile(r"localhost|127\.0\.0|0\.0\.0\.0|::1|169\.254|metadata|is_?private|is_?loopback|loopback|block_?private|is_?internal|\bprivate\b|\binternal\b|ssrf|\b10\.0\.0|192\.168|172\.1[6-9]", re.I)
+SSRF_ROBUST = re.compile(r"ipaddress|ip_?address|is_?private|netmask|cidr|ip_?range|private_?ip|ssrf_?filter|request_?filtering", re.I)
+SSRF_IPV6_LOOPBACK = re.compile(r"::1")
+SSRF_ALLZEROS = re.compile(r"0\.0\.0\.0")
+SSRF_MAPPED = re.compile(r"::ffff|ipv4[-_]?mapped|\bmapped\b", re.I)
+
+
+def _guard_tokens(test, idx, depth=0):
+    parts = []
+    for n in ast.walk(test):
+        if isinstance(n, ast.Name):
+            parts.append(n.id)
+        elif isinstance(n, ast.Attribute):
+            parts.append(n.attr)
+        elif isinstance(n, ast.Constant):
+            parts.append(str(n.value))
+    if depth < 1:
+        for n in ast.walk(test):
+            if isinstance(n, ast.Call):
+                r = resolve_call(n.func, idx)
+                if r:
+                    parts.append(_guard_tokens(r[0], idx, depth + 1))
+    return " ".join(parts).lower()
+
+
+def ssrf_guard_coverage(tokens):
+    if SSRF_ROBUST.search(tokens):
+        return "complete"
+    if not SSRF_BLOCKLIST.search(tokens):
+        return "none"
+    covers = SSRF_IPV6_LOOPBACK.search(tokens) and SSRF_ALLZEROS.search(tokens) and SSRF_MAPPED.search(tokens)
+    return "complete" if covers else "incomplete"
+
+
+def ssrf_guard_sets(fn, sources, idx):
+    """(safe, weak) tainted-name sets, grouping names into derivation components and judging each
+    component by its guard: complete ⇒ safe (suppress), incomplete ⇒ weak (still a live bypass)."""
+    raw = propagate(fn, sources)
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        parent[find(a)] = find(b)
+
+    def tainted_ids(node):
+        return [n.id for n in ast.walk(node) if isinstance(n, ast.Name) and n.id in raw] if node else []
+
+    for n in raw:
+        find(n)
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                for tgt in (x.id for x in ast.walk(t) if isinstance(x, ast.Name) and x.id in raw):
+                    for s in tainted_ids(n.value):
+                        union(tgt, s)
+        elif isinstance(n, ast.AnnAssign) and n.value and isinstance(n.target, ast.Name) and n.target.id in raw:
+            for s in tainted_ids(n.value):
+                union(n.target.id, s)
+
+    safe_roots, weak_roots = set(), set()
+    for n in ast.walk(fn):
+        if isinstance(n, ast.If) and _body_bounces(n.body):
+            cov = ssrf_guard_coverage(_guard_tokens(n.test, idx))
+            if cov == "none":
+                continue
+            for v in tainted_ids(n.test):
+                (safe_roots if cov == "complete" else weak_roots).add(find(v))
+    safe, weak = set(), set()
+    for n in raw:
+        r = find(n)
+        if r in safe_roots:
+            safe.add(n)
+        elif r in weak_roots:
+            weak.add(n)
+    return safe, weak
 
 
 def fn_params(fn):
@@ -272,11 +366,15 @@ def analyze_fn(fn, seed, file, ctx, depth, visited, via):
         return
     visited.add(id(fn))
     taint = taint_of(fn, seed)
-    sql_built = sql_built_from_taint(fn, taint)
     label = ctx["label"] + (f" (via {via})" if via else "")
     where = f"MCP {label}"
     out = ctx["out"]
     idx = ctx["idx"]
+    # SSRF-specific taint: drop names a COMPLETE private-net guard protects, re-add names only an
+    # INCOMPLETE (bypassable) guard "cleared". Other sinks keep the generic guard-cleared `taint`.
+    ssrf_safe, ssrf_weak = ssrf_guard_sets(fn, seed, idx)
+    ssrf_taint = (taint - ssrf_safe) | ssrf_weak
+    sql_built = sql_built_from_taint(fn, taint)
 
     def emit(_id, cwe, sev, title, detail, line):
         out.append({"id": _id, "cwe": cwe, "severity": sev, "title": f"{title} in {where}",
@@ -314,7 +412,10 @@ def analyze_fn(fn, seed, file, ctx, depth, visited, via):
                      f"Attacker-influenced MCP input is the path in `{name}(...)` with no traversal guard — a crafted `../` reads/writes arbitrary files. Resolve against a fixed root and reject escapes.", n.lineno)
 
             if NET.search(name) and NET_OBJ.search(name) and args:
-                if refs_taint(args[0], taint):
+                if refs_taint(args[0], ssrf_taint) and refs_taint(args[0], ssrf_weak):
+                    emit("ssrf-guard-bypass", "CWE-918", "HIGH", "Outbound URL passes an incomplete SSRF guard",
+                         f"Attacker-influenced MCP input is the URL of `{name}(...)` behind a private-network/loopback guard that misses known bypass forms — IPv6 loopback `[::1]`, IPv4-mapped `::ffff:127.0.0.1`, `0.0.0.0`, and decimal/hex/octal-encoded IPs — and does not re-check the host after redirects (cf. mcp-sanitizer GHSA-4mfg-r38w-w8fg). Allowlist hosts, or normalize to a canonical IP and reject the full private range (a vetted library), re-validating on every redirect.", n.lineno)
+                elif refs_taint(args[0], ssrf_taint):
                     emit("ssrf", "CWE-918", "HIGH", "Tool input controls an outbound request URL",
                          f"Attacker-influenced MCP input is the URL of `{name}(...)` — SSRF (internal metadata/localhost reachable). Allowlist hosts.", n.lineno)
                 elif taint_arg(args[1:], taint) or any(refs_taint(kw.value, taint) for kw in n.keywords):
@@ -390,6 +491,122 @@ def _scan_environ(fn, where, label, file, out):
                         "file": file, "line": n.lineno, "handler": label})
 
 
+# ---- unbounded input / resource exhaustion (CWE-770) -----------------------
+# Seed: MCP TypeScript SDK GHSA-f897-62hf-6gxq — an HTTP transport read a request body / iterated a
+# JSON-RPC batch with no size/length cap before parsing (memory exhaustion). Transport-level, so it
+# is scanned structurally over every function in an MCP file, not only inside registered handlers.
+SIZE_NAME = re.compile(r"(length|byte|size|bytes|len|total|count|received|read|accumulated)", re.I)
+LIMIT_NAME = re.compile(r"(max|limit|cap|bound|threshold|quota)", re.I)
+DISPATCH_FN = re.compile(r"(handle|dispatch|process|on_?message|route|execute|serve)", re.I)
+RPC_MEMBER = {"method", "jsonrpc", "id", "params"}
+GROW_METHOD = {"append", "extend", "write", "concat"}
+STREAM_ATTR = re.compile(r"(stream|iter_any|iter_content|iter_chunked|iter_chunks|__aiter__)$", re.I)
+
+
+def _is_size_side(n):
+    if isinstance(n, ast.Call):  # len(x)
+        return dotted(n.func).split(".")[-1] == "len"
+    if isinstance(n, ast.Attribute):
+        return bool(SIZE_NAME.search(n.attr))
+    if isinstance(n, ast.Name):
+        return bool(SIZE_NAME.search(n.id))
+    return False
+
+
+def _is_limit_side(n):
+    if isinstance(n, ast.Constant):
+        return isinstance(n.value, (int, float)) and n.value > 0
+    if isinstance(n, ast.Name):
+        return bool(LIMIT_NAME.search(n.id))
+    if isinstance(n, ast.Attribute):
+        return bool(LIMIT_NAME.search(n.attr))
+    return False
+
+
+def has_size_cap(fn):
+    """A comparison of a size/len quantity against a positive numeric/limit value (`len(b) > MAX`,
+    `size > 1_000_000`). `i < len(x)` is NOT one — the non-size side is a loop index."""
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Compare) and n.ops and isinstance(n.ops[0], (ast.Lt, ast.LtE, ast.Gt, ast.GtE)):
+            left, right = n.left, n.comparators[0]
+            if (_is_size_side(left) and _is_limit_side(right)) or (_is_size_side(right) and _is_limit_side(left)):
+                return True
+    return False
+
+
+def _grows_buffer(scope):
+    for n in ast.walk(scope):
+        if isinstance(n, ast.AugAssign) and isinstance(n.op, ast.Add):
+            return True
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in GROW_METHOD:
+            return True
+    return False
+
+
+def _accumulates_body(fn):
+    for n in ast.walk(fn):
+        if isinstance(n, ast.AsyncFor) and _grows_buffer(n):  # async for chunk in request.stream()
+            return True
+        if isinstance(n, ast.For) and _grows_buffer(n):
+            it = n.iter
+            if isinstance(it, ast.Call) and STREAM_ATTR.search(dotted(it.func)):
+                return True
+            if isinstance(it, (ast.Attribute, ast.Name)) and STREAM_ATTR.search(dotted(it)):
+                return True
+    return False
+
+
+def _looks_like_dispatch(scope):
+    nodes = scope if isinstance(scope, list) else [scope]
+    for node in nodes:
+        for n in ast.walk(node):
+            if isinstance(n, ast.Call) and DISPATCH_FN.search(dotted(n.func)):
+                return True
+            if isinstance(n, ast.Attribute) and n.attr in RPC_MEMBER:
+                return True
+    return False
+
+
+def _has_isinstance_list(fn):
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Call) and dotted(n.func) == "isinstance":
+            if len(n.args) == 2 and (dotted(n.args[1]) in ("list", "tuple")):
+                return True
+    return False
+
+
+def _has_dispatch_iteration(fn):
+    for n in ast.walk(fn):
+        if isinstance(n, ast.For) and not isinstance(n, ast.AsyncFor) and _looks_like_dispatch(n.body):
+            return True
+        if isinstance(n, (ast.ListComp, ast.GeneratorExp)) and _looks_like_dispatch(n.elt):
+            return True
+    return False
+
+
+def scan_unbounded(parsed):
+    out = []
+    for file, tree, src in parsed:
+        if not is_mcp_file(src):
+            continue
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if has_size_cap(fn):
+                continue
+            if _accumulates_body(fn):
+                out.append({"id": "unbounded-body", "cwe": "CWE-770", "severity": "HIGH",
+                            "title": "Request body is accumulated without a size cap",
+                            "detail": "An HTTP transport reads and accumulates a request body (an async stream / chunk loop) with no byte/length limit enforced before it is buffered or parsed. A single large request exhausts server memory (cf. MCP SDK GHSA-f897-62hf-6gxq). Cap the accumulated size and reject once exceeded.",
+                            "file": file, "line": fn.lineno, "handler": "(HTTP transport)"})
+            elif _has_isinstance_list(fn) and _has_dispatch_iteration(fn):
+                out.append({"id": "unbounded-batch", "cwe": "CWE-770", "severity": "HIGH",
+                            "title": "JSON-RPC batch is iterated without a length cap",
+                            "detail": "A JSON-RPC batch (`isinstance(message, list)` → the message list) is dispatched element-by-element with no cap on the list length before processing. A huge batch array exhausts memory/CPU (cf. MCP SDK GHSA-f897-62hf-6gxq). Reject batches longer than a fixed maximum before iterating.",
+                            "file": file, "line": fn.lineno, "handler": "(JSON-RPC transport)"})
+    return out
+
+
 # ---- entry -----------------------------------------------------------------
 
 def collect_files(path):
@@ -420,6 +637,7 @@ def scan_project(path):
     fastapi_mcp = any(re.search(r"fastapi[_-]?mcp|FastApiMCP", s) for _, _, s in parsed)
     autogen = any(re.search(r"\b(py)?autogen\b", s) for _, _, s in parsed)
     out = []
+    out.extend(scan_unbounded(parsed))  # transport-level unbounded body / JSON-RPC batch (CWE-770)
 
     def run_handler(node, file, idx, out, kindhint=None):
         kind = kindhint or is_handler(node, allow_fastapi=fastapi_mcp, allow_autogen=autogen)

@@ -12,6 +12,7 @@
 import * as walk from "acorn-walk";
 import { type Node, memberName, parse } from "./analyze.js";
 import { type Handler, findHandlers, isMcpFile, paramNames } from "./mcp.js";
+import { scanUnbounded } from "./unbounded.js";
 
 export type Severity = "HIGH" | "MEDIUM" | "LOW";
 
@@ -91,7 +92,8 @@ function guardValidatedNames(fn: Node, taint: Set<string>): Set<string> {
   return validated;
 }
 
-function taintOf(fn: Node, sources: string[]): Set<string> {
+/** Taint propagation WITHOUT guard-clearing — the raw reachable set. */
+function propagate(fn: Node, sources: string[]): Set<string> {
   const taint = new Set<string>(sources);
   for (let pass = 0; pass < 6; pass++) {
     const before = taint.size;
@@ -105,9 +107,107 @@ function taintOf(fn: Node, sources: string[]): Set<string> {
     });
     if (taint.size === before) break;
   }
+  return taint;
+}
+
+function taintOf(fn: Node, sources: string[]): Set<string> {
+  const taint = propagate(fn, sources);
   // a bouncer guard that content-validates a tainted value clears it downstream (guard-by-throw)
   for (const v of guardValidatedNames(fn, taint)) taint.delete(v);
   return taint;
+}
+
+// ---- SSRF-guard awareness (seed: mcp-sanitizer GHSA-4mfg-r38w-w8fg) --------
+// A private-network/loopback BLOCKLIST guard is the common SSRF defense, but it is only as good as
+// the forms it rejects. The mcp-sanitizer bug allowed loopback via bracketed IPv6 ([::1]) and an
+// explicit port; the whole bypass class is IPv6 loopback (::1), IPv4-mapped (::ffff:127.0.0.1),
+// 0.0.0.0, and decimal/hex/octal-encoded IPs — plus NOT re-checking the host after a redirect.
+// So: a guard that names loopback/private forms but MISSES those is still a live SSRF (guard-bypass);
+// an ALLOWLIST guard (startsWith(base) / isApiHost / host === "api.github.com") is the correct
+// defense and must stay clean — it never names the blocklist forms, so it is not mistaken for one.
+
+/** A guard whose intent is to REJECT loopback/private destinations (blocklist-style). */
+const SSRF_BLOCKLIST = /localhost|127\.0\.0|0\.0\.0\.0|::1|169\.254|metadata|isprivate|isloopback|loopback|blockprivate|is[-_]?internal|\bprivate\b|\binternal\b|ssrf|\b10\.0\.0|192\.168|172\.1[6-9]/i;
+/** Delegation to a library/primitive that handles the full private-IP space is treated as complete. */
+const SSRF_ROBUST = /ipaddr|is[-_]?ip\b|netmask|cidr|ip[-_]?range[-_]?check|private[-_]?ip|net\.isip|ssrf[-_]?(req[-_]?)?filter|request[-_]?filtering|blockedcidr/i;
+const SSRF_IPV6_LOOPBACK = /::1/;
+const SSRF_ALLZEROS = /0\.0\.0\.0/;
+const SSRF_MAPPED = /::ffff|ipv4[-_]?mapped|\bmapped\b/i;
+
+/** Lowercased bag of identifiers + string/regex/numeric literal text under a node (and, one hop deep,
+ *  the bodies of resolvable predicate functions it calls) — enough to judge what a guard covers. */
+function guardTokens(node: Node | undefined, idx: Map<string, IndexedFn[]>, depth = 0): string {
+  if (!node) return "";
+  const parts: string[] = [];
+  walk.simple(node as any, {
+    Identifier(x: any) { parts.push(x.name); },
+    Literal(x: any) { if (x.regex) parts.push(x.regex.pattern); else if (x.value != null) parts.push(String(x.value)); },
+    TemplateLiteral(x: any) { for (const q of x.quasis ?? []) parts.push(q.value?.cooked ?? q.value?.raw ?? ""); },
+  });
+  if (depth < 1) {
+    walk.simple(node as any, {
+      CallExpression(c: any) {
+        const r = resolveCall(c.callee, idx);
+        if (r) parts.push(guardTokens(r.fn.body, idx, depth + 1));
+      },
+    });
+  }
+  return parts.join(" ").toLowerCase();
+}
+
+/** Classify a guard's SSRF coverage from its tokens: not an SSRF blocklist guard, a complete one, or
+ *  an incomplete one (names loopback/private but misses the IPv6/mapped/0.0.0.0 bypass forms). */
+function ssrfGuardCoverage(tokens: string): "none" | "complete" | "incomplete" {
+  if (SSRF_ROBUST.test(tokens)) return "complete"; // delegates to a full private-IP library — correct
+  if (!SSRF_BLOCKLIST.test(tokens)) return "none"; // allowlist / unrelated guard — correct defense, leave clean
+  const covers = SSRF_IPV6_LOOPBACK.test(tokens) && SSRF_ALLZEROS.test(tokens) && SSRF_MAPPED.test(tokens);
+  return covers ? "complete" : "incomplete";
+}
+
+/** SSRF guards usually validate a value DERIVED from the URL (`new URL(url).hostname`) while the
+ *  original `url` is what gets fetched, so a per-name check misses the link. We group tainted names
+ *  into derivation components (a var is unioned with the tainted names in its initializer) and judge
+ *  a guard against the whole component: a COMPLETE guard makes the component `safe` (suppress SSRF —
+ *  the hardened-server negative control), an INCOMPLETE one makes it `weak` (still a live bypass).
+ *  Coarse at the param level (two distinct user URLs in one handler share the param root), which is a
+ *  rare, deliberate false-NEGATIVE in line with this scanner's FP-aversion — never a false alarm. */
+function ssrfGuardSets(fn: Node, sources: string[], idx: Map<string, IndexedFn[]>): { safe: Set<string>; weak: Set<string> } {
+  const raw = propagate(fn, sources);
+  const parent = new Map<string, string>();
+  const find = (x: string): string => {
+    if (!parent.has(x)) parent.set(x, x);
+    let r = x;
+    while (parent.get(r) !== r) r = parent.get(r)!;
+    parent.set(x, r);
+    return r;
+  };
+  const union = (a: string, b: string) => { parent.set(find(a), find(b)); };
+  const taintedIdsIn = (node: Node | undefined): string[] => {
+    const out: string[] = [];
+    if (node) walk.simple(node as any, { Identifier(x: any) { if (raw.has(x.name)) out.push(x.name); } });
+    return out;
+  };
+  for (const n of raw) find(n);
+  walk.simple(fn as any, {
+    VariableDeclarator(n: any) { if (n.id?.type === "Identifier" && raw.has(n.id.name)) for (const s of taintedIdsIn(n.init)) union(n.id.name, s); },
+    AssignmentExpression(n: any) { if (n.left?.type === "Identifier" && raw.has(n.left.name)) for (const s of taintedIdsIn(n.right)) union(n.left.name, s); },
+  });
+  const safeRoots = new Set<string>(), weakRoots = new Set<string>();
+  walk.simple(fn as any, {
+    IfStatement(n: any) {
+      if (!bounces(n.consequent)) return;
+      const cov = ssrfGuardCoverage(guardTokens(n.test, idx));
+      if (cov === "none") return;
+      for (const v of taintedIdsIn(n.test)) (cov === "complete" ? safeRoots : weakRoots).add(find(v));
+    },
+  });
+  const safe = new Set<string>(), weak = new Set<string>();
+  for (const n of raw) {
+    const r = find(n);
+    if (safeRoots.has(r)) safe.add(n);
+    else if (weakRoots.has(r)) weak.add(n);
+  }
+  return { safe, weak };
 }
 
 // ---- project function index (for cross-function resolution) ----------------
@@ -260,17 +360,30 @@ function analyzeFn(fn: Node, seed: string[], file: string, ctx: Ctx, depth: numb
   if (!fn || visited.has(fn) || depth > MAX_DEPTH) return;
   visited.add(fn);
   const taint = taintOf(fn, seed);
+  // SSRF-specific taint: drop names a COMPLETE private-net guard protects, re-add names only an
+  // INCOMPLETE (bypassable) guard "cleared". Other sinks keep using `taint` (generic guard-clearing).
+  const { safe: ssrfSafe, weak: ssrfWeak } = ssrfGuardSets(fn, seed, ctx.idx);
+  const ssrfTaint = new Set<string>([...taint].filter((n) => !ssrfSafe.has(n)));
+  for (const w of ssrfWeak) ssrfTaint.add(w);
   const sqlBuilt = strBuiltFromTaint(fn, taint);
   const pathOnly = new Set<string>(seedPathOnly);
   for (const n of urlPathOnlyNames(fn, taint)) pathOnly.add(n);
   const where = ctx.label + (via ? ` (via ${via})` : "");
   const tainted = (node: Node | undefined) => node && !isSanitized(node) && refsTaint(node, taint);
-  // classify a URL argument's taint position: "host" (real SSRF) | "path" (fixed host) | null
+  const ssrfTainted = (node: Node | undefined) => node && !isSanitized(node) && refsTaint(node, ssrfTaint);
+  const refsSet = (node: Node | undefined, set: Set<string>) => {
+    if (!node) return false;
+    let hit = false;
+    walk.simple(node as any, { Identifier(x: any) { if (set.has(x.name)) hit = true; } });
+    return hit;
+  };
+  // classify a URL argument's taint position: "host" (real SSRF) | "path" (fixed host) | null.
+  // Uses ssrfTaint so a complete-guard'd URL reads as untainted and a weak-guard'd one stays tainted.
   const urlClass = (a: Node | undefined): "host" | "path" | null => {
-    const direct = classifyUrlTaint(a, taint);
+    const direct = classifyUrlTaint(a, ssrfTaint);
     if (direct) return direct;
     if (a?.type === "Identifier" && pathOnly.has(a.name)) return "path";
-    return tainted(a) ? "host" : null;
+    return ssrfTainted(a) ? "host" : null;
   };
   // a SQL arg is injectable if it's an inline template/concat of taint, or a var built that way
   const sqlInterp = (a: Node | undefined) => isConcatOrTemplate(a) || (a?.type === "Identifier" && sqlBuilt.has(a.name));
@@ -304,7 +417,10 @@ function analyzeFn(fn: Node, seed: string[], file: string, ctx: Ctx, depth: numb
       const isNet = bare === "fetch" || bare === "axios" || (NET_METHOD.test(prop) && NET_OBJ.test(obj)) || /(^|\.)fetch$/.test(full);
       if (isNet && args[0]) {
         const cls = urlClass(args[0]);
-        if (cls === "host") emit("ssrf", "CWE-918", "HIGH", "Tool input controls an outbound request URL",
+        // a URL reachable only because an INCOMPLETE private-network guard "cleared" it = live bypass
+        if (cls === "host" && refsSet(args[0], ssrfWeak)) emit("ssrf-guard-bypass", "CWE-918", "HIGH", "Outbound URL passes an incomplete SSRF guard",
+          `Attacker-influenced MCP input is the URL of \`${full || bare}(...)\` behind a private-network/loopback guard that misses known bypass forms — IPv6 loopback \`[::1]\`, IPv4-mapped \`::ffff:127.0.0.1\`, \`0.0.0.0\`, and decimal/hex/octal-encoded IPs — and does not re-check the host after redirects (cf. mcp-sanitizer GHSA-4mfg-r38w-w8fg). Allowlist hosts, or normalize to a canonical IP and reject the full private range (use a vetted library), re-validating on every redirect.`, n.loc?.start.line);
+        else if (cls === "host") emit("ssrf", "CWE-918", "HIGH", "Tool input controls an outbound request URL",
           `Attacker-influenced MCP input is the URL of \`${full || bare}(...)\` — SSRF: the attacker picks the destination (internal metadata endpoints, localhost services). Allowlist hosts.`, n.loc?.start.line);
         else if (cls === "path") emit("ssrf", "CWE-918", "MEDIUM", "Tool input is a path/query on a fixed-host URL",
           `Attacker-influenced MCP input is interpolated into the PATH/query of \`${full || bare}(...)\`, but the host is fixed (a literal or base-URL prefix precedes it) — not host-controlled SSRF. Still worth a path-traversal/parameter-tampering check; confirm the base host and that \`../\` can't redirect it.`, n.loc?.start.line);
@@ -369,6 +485,8 @@ export function scanProject(files: Array<{ file: string; source: string }>): Fin
   }
   const idx = buildIndex(parsed);
   const out: Finding[] = [];
+  const mcpParsed = parsed.filter((p) => isMcpFile(p.source));
+  out.push(...scanUnbounded(mcpParsed)); // transport-level unbounded body / JSON-RPC batch (CWE-770)
   for (const { file, source, ast } of parsed) {
     if (!isMcpFile(source)) continue;
     for (const h of findHandlers(ast)) {

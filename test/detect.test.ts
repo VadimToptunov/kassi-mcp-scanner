@@ -346,3 +346,125 @@ test("SSRF: whole tainted value as URL is still HIGH (regression guard)", () => 
   const f = mcp(`server.tool("f", async (args) => { await fetch(args.url); });`);
   assert.equal(f.find((x) => x.id === "ssrf")?.severity, "HIGH");
 });
+
+// ---- SSRF-guard awareness (seed: mcp-sanitizer GHSA-4mfg-r38w-w8fg) --------
+
+test("SSRF guard bypass: a loopback blocklist that misses IPv6/0.0.0.0/mapped is flagged", () => {
+  const f = mcp(`
+    server.tool("fetch_url", { url: z.string() }, async (args) => {
+      if (args.url.includes("localhost") || args.url.includes("127.0.0.1")) throw new Error("blocked");
+      return await fetch(args.url);
+    });`);
+  const s = f.find((x) => x.id === "ssrf-guard-bypass");
+  assert.equal(s?.severity, "HIGH", "an incomplete private-network guard is still a live SSRF");
+  assert.equal(f.filter((x) => x.id === "ssrf").length, 0, "reported as the guard-bypass variant, not plain ssrf");
+});
+
+test("SSRF guard bypass: guard on a DERIVED hostname, original url fetched, still flagged", () => {
+  const f = mcp(`
+    server.tool("f", { url: z.string() }, async (args) => {
+      const host = new URL(args.url).hostname;
+      if (host === "localhost" || host === "127.0.0.1") throw new Error("no");
+      return await fetch(args.url);
+    });`);
+  assert.deepEqual(f.map((x) => x.id), ["ssrf-guard-bypass"]);
+});
+
+test("SSRF guard bypass: an incomplete guard resolved across a predicate function is flagged", () => {
+  const f = mcp(`
+    function isBlocked(u) { const h = new URL(u).hostname; return h === "localhost" || h === "127.0.0.1"; }
+    server.tool("f", { url: z.string() }, async (args) => {
+      if (isBlocked(args.url)) throw new Error("no");
+      return await fetch(args.url);
+    });`);
+  assert.deepEqual(f.map((x) => x.id), ["ssrf-guard-bypass"], "predicate body inspected one hop deep");
+});
+
+test("SSRF guard COMPLETE: blocklist covering ::1 / 0.0.0.0 / ::ffff is clean (negative control)", () => {
+  const f = mcp(`
+    server.tool("f", { url: z.string() }, async (args) => {
+      const h = new URL(args.url).hostname;
+      if (h === "localhost" || h === "127.0.0.1" || h === "0.0.0.0" || h === "::1" || h.startsWith("::ffff:")) throw new Error("no");
+      return await fetch(args.url);
+    });`);
+  assert.deepEqual(f.map((x) => x.id), [], "a guard covering the known bypass forms must NOT fire");
+});
+
+test("SSRF guard COMPLETE: delegation to a private-IP library (ipaddr.js) is clean", () => {
+  const f = mcp(`
+    import ipaddr from "ipaddr.js";
+    server.tool("f", { url: z.string() }, async (args) => {
+      const h = new URL(args.url).hostname;
+      if (ipaddr.parse(h).range() !== "unicast") throw new Error("private");
+      return await fetch(args.url);
+    });`);
+  assert.deepEqual(f.map((x) => x.id), [], "a vetted private-IP library is a complete guard");
+});
+
+test("SSRF guard: an ALLOWLIST guard is the correct defense and stays clean (no false alarm)", () => {
+  const f = mcp(`
+    server.tool("f", { url: z.string() }, async (args) => {
+      if (!isApifyApiUri(args.url)) throw new Error("bad origin");
+      return await fetch(args.url);
+    });`);
+  assert.deepEqual(f.map((x) => x.id), [], "allowlisting is not mistaken for a leaky blocklist");
+});
+
+// ---- unbounded input / resource exhaustion (seed: MCP TS SDK GHSA-f897-62hf-6gxq) ----
+
+test("unbounded body: .on('data') accumulation with no size cap is HIGH", () => {
+  const f = mcp(`
+    export function handleHttp(req, res) {
+      let body = "";
+      req.on("data", (chunk) => { body += chunk; });
+      req.on("end", () => { const msg = JSON.parse(body); dispatch(msg); });
+    }`);
+  assert.deepEqual(f.map((x) => x.id), ["unbounded-body"]);
+  assert.equal(f[0].severity, "HIGH");
+});
+
+test("unbounded body: for-await stream accumulation with no cap is HIGH", () => {
+  const f = mcp(`
+    export async function readBody(req) {
+      let data = "";
+      for await (const chunk of req) { data += chunk; }
+      return JSON.parse(data);
+    }`);
+  assert.deepEqual(f.map((x) => x.id), ["unbounded-body"]);
+});
+
+test("unbounded body NEGATIVE: a running byte-count cap clears it", () => {
+  const f = mcp(`
+    export function handleHttp(req, res) {
+      let body = ""; let size = 0;
+      req.on("data", (chunk) => { size += chunk.length; if (size > 1048576) throw new Error("too large"); body += chunk; });
+    }`);
+  assert.deepEqual(f.map((x) => x.id), [], "a size cap makes the read bounded");
+});
+
+test("unbounded batch: Array.isArray + dispatch with no length cap is HIGH", () => {
+  const f = mcp(`
+    export function onMessage(parsed) {
+      const messages = Array.isArray(parsed) ? parsed : [parsed];
+      return messages.map((m) => handleMessage(m));
+    }`);
+  assert.deepEqual(f.map((x) => x.id), ["unbounded-batch"]);
+});
+
+test("unbounded batch NEGATIVE: a length cap before iterating clears it", () => {
+  const f = mcp(`
+    export function onMessage(parsed) {
+      const messages = Array.isArray(parsed) ? parsed : [parsed];
+      if (messages.length > 100) throw new Error("batch too large");
+      return messages.map((m) => handleMessage(m));
+    }`);
+  assert.deepEqual(f.map((x) => x.id), [], "a batch-length cap makes it bounded");
+});
+
+test("unbounded NEGATIVE: a plain .on('data') that does not accumulate is not flagged", () => {
+  const f = mcp(`
+    export function handleHttp(req, res) {
+      req.on("data", (chunk) => { console.log("chunk", chunk.length); });
+    }`);
+  assert.deepEqual(f.map((x) => x.id), [], "no accumulation, no unbounded-growth finding");
+});

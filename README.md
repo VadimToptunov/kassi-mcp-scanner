@@ -21,6 +21,9 @@ Docker needed.
 | `code-exec` | CWE-94 | `eval`/`Function`/`vm` (JS); `eval`/`exec`/`compile` (Py) |
 | `path-traversal` | CWE-22 | `fs.*` / `open()` / `pathlib` with a tainted path (basename-guarded paths are cleared) |
 | `ssrf` | CWE-918 | `fetch`/`axios`/`http` (JS); `requests`/`httpx`/`urllib` (Py) — tainted URL=HIGH, body=MEDIUM |
+| `ssrf-guard-bypass` | CWE-918 | a tainted URL passes a private-network/loopback **blocklist** guard that misses the known bypass forms — IPv6 `[::1]`, IPv4-mapped `::ffff:127.0.0.1`, `0.0.0.0`, encoded IPs (a *complete* guard or an allowlist is clean) |
+| `unbounded-body` | CWE-770 | an HTTP transport accumulates a request body (`.on("data")` / `for await` / async stream) with no size cap before buffering/parsing |
+| `unbounded-batch` | CWE-770 | a JSON-RPC batch (`Array.isArray`/`isinstance(...,list)`) is dispatched element-by-element with no length cap |
 | `sql-injection` | CWE-89 | tainted value interpolated into a raw query (parameterized is safe) |
 | `deserialization` | CWE-502 | **Py**: `pickle`/`dill`/`marshal` loads, or `yaml.load` without SafeLoader, on tainted input |
 | `tool-poisoning` | CWE-94 | prompt-injection text or invisible unicode hidden in a tool's **description/docstring** |
