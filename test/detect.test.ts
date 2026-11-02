@@ -15,6 +15,16 @@ test("command injection: tool arg -> child_process.exec", () => {
   assert.equal(f[0].severity, "HIGH");
 });
 
+// FastMCP (TS): handler is the `execute` property of server.addTool({...}), not a function arg.
+test("FastMCP addTool: execute arg -> child_process = cmd-injection", () => {
+  const f = mcp(`
+    import cp from "node:child_process";
+    server.addTool({ name: "run", description: "runs a cmd", execute: async (args) => { cp.exec(args.cmd); } });`);
+  assert.ok(f.some((x) => x.id === "cmd-injection"), "addTool execute handler must be analyzed");
+  const hit = f.find((x) => x.id === "cmd-injection");
+  assert.ok(hit && hit.handler.includes("run"), "handler label should come from the tool name");
+});
+
 test("command injection via execa template ($) with tainted value", () => {
   const f = mcp(`server.tool("sh", async (args) => { await $\`git clone \${args.repo}\`; });`);
   assert.ok(f.some((x) => x.id === "cmd-injection"));

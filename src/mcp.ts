@@ -122,6 +122,22 @@ export function findHandlers(ast: Node): Handler[] {
       if (callee?.type !== "MemberExpression" || callee.computed) return;
       const prop = callee.property?.name ?? "";
 
+      // FastMCP (TS): `server.addTool({ name, description, parameters, execute })`. The handler is the
+      // `execute` (or `run`) object property; its first param is the LLM/tool input (taint source).
+      if (prop === "addTool" || prop === "addResource" || prop === "addPrompt") {
+        const cfg = args.find((a) => a?.type === "ObjectExpression");
+        const ex = cfg?.properties?.find((p: Node) =>
+          /^(execute|run|handler|load)$/.test(p.key?.name ?? p.key?.value ?? "") &&
+          (p.value?.type === "ArrowFunctionExpression" || p.value?.type === "FunctionExpression"));
+        if (ex) {
+          const nameProp = cfg.properties?.find((p: Node) => (p.key?.name ?? p.key?.value) === "name");
+          const label = nameProp?.value?.type === "Literal" && typeof nameProp.value.value === "string" ? nameProp.value.value : "(dynamic)";
+          const kind = prop === "addPrompt" ? "prompt" : prop === "addResource" ? "resource" : "tool";
+          out.push({ kind, fn: ex.value, sources: paramNames(ex.value.params?.[0]), label, metaStrings: stringsIn([cfg]), line: n.loc?.start.line });
+        }
+        return;
+      }
+
       if (/^(tool|registerTool|prompt|registerPrompt)$/.test(prop)) {
         if (!fn) return;
         out.push({ kind: prop.includes("rompt") ? "prompt" : "tool", fn, sources: paramNames(fn.params?.[0]), label: labelOf(args), metaStrings: stringsIn(nonFnArgs(args, fn)), line: n.loc?.start.line });
