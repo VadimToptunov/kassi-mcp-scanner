@@ -13,12 +13,25 @@ import { fileURLToPath } from "node:url";
 import { type Finding, type Severity, scanProject } from "./detect.js";
 
 const SRC_RE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|py)$/;
-const SKIP = new Set(["node_modules", "dist", ".git", "build", "coverage", "out", "venv", ".venv", "__pycache__"]);
+const SKIP = new Set(["node_modules", "dist", ".git", "build", "coverage", "out", "venv", ".venv", "__pycache__",
+  // test / spec trees: their fixtures and seams are not a running server's attack surface, and they
+  // dominated the sweep's false-positive funnel (deliberately-unsafe fixtures, "not reachable" seams).
+  "test", "tests", "__tests__", "spec", "specs", "e2e", "__mocks__"]);
+// Test/spec FILES anywhere (foo.test.ts, foo.spec.js, test_foo.py, foo_test.py, conftest.py).
+const TEST_FILE = /(\.(test|spec)\.[cm]?[jt]sx?$)|((^|[\/])(test_.*|conftest)\.py$)|(_test\.py$)/i;
+const isScannable = (p: string) => SRC_RE.test(p) && !TEST_FILE.test(p);
 const RANK: Record<Severity, number> = { HIGH: 3, MEDIUM: 2, LOW: 1 };
 
 // Python MCP/AI servers are analyzed by the sibling ast-based script (py/mcpscan.py); the target
-// file is only parsed there, never executed. Resolve the script next to this module (src/ or dist/).
-const PY_SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../py/mcpscan.py");
+// file is only parsed there, never executed. The script lives at the repo root's `py/`, but this
+// module runs from either `src/` (tsx) or `dist/src/` (compiled — tsc nests under dist/ because
+// rootDir is "."), so `../py` is right for one and `../../py` for the other. Probe both and fall
+// back to the first existing one, so the compiled build does not SILENTLY skip all Python files.
+const PY_SCRIPT = ((): string => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [path.resolve(here, "../py/mcpscan.py"), path.resolve(here, "../../py/mcpscan.py")];
+  return candidates.find((p) => fs.existsSync(p)) ?? candidates[0];
+})();
 const PY_GATE = /\b(mcp|fastmcp|modelcontextprotocol)\b|langchain|llama_index|llama-index/i;
 let pyMissing = false;
 
@@ -38,11 +51,11 @@ function scanPythonProject(target: string): Finding[] {
 function walkFiles(root: string, acc: string[] = []): string[] {
   let st: fs.Stats;
   try { st = fs.statSync(root); } catch { return acc; }
-  if (st.isFile()) { if (SRC_RE.test(root)) acc.push(root); return acc; }
+  if (st.isFile()) { if (isScannable(root)) acc.push(root); return acc; } // explicit file arg: still skip test files
   if (!st.isDirectory()) return acc;
   for (const e of fs.readdirSync(root, { withFileTypes: true })) {
     if (e.isDirectory()) { if (!SKIP.has(e.name)) walkFiles(path.join(root, e.name), acc); }
-    else if (SRC_RE.test(e.name)) acc.push(path.join(root, e.name));
+    else if (isScannable(e.name)) acc.push(path.join(root, e.name));
   }
   return acc;
 }

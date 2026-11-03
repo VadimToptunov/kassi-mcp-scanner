@@ -42,6 +42,16 @@ function refsTaint(node: Node | undefined, taint: Set<string>): boolean {
   return found;
 }
 
+/** Taint FLOW for an assigned value: a `cond ? a : b` evaluates to a branch, never the condition, so
+ *  taint must not flow from the TEST. Without this, `where = (userDays===null) ? "" : "WHERE …"` is
+ *  marked tainted because the condition refs a tainted value, though every branch is a constant — the
+ *  SQL false positive from the sweep (ghostwright/phantom). Non-ternary values use the plain walk. */
+function flowRefsTaint(node: Node | undefined, taint: Set<string>): boolean {
+  if (node?.type === "ConditionalExpression")
+    return flowRefsTaint(node.consequent, taint) || flowRefsTaint(node.alternate, taint);
+  return refsTaint(node, taint);
+}
+
 function unwrapAwait(node: Node | undefined): Node | undefined {
   return node?.type === "AwaitExpression" ? node.argument : node;
 }
@@ -99,10 +109,10 @@ function propagate(fn: Node, sources: string[]): Set<string> {
     const before = taint.size;
     walk.simple(fn as any, {
       VariableDeclarator(n: any) {
-        if (n.id?.type === "Identifier" && !isSanitized(n.init) && refsTaint(n.init, taint)) taint.add(n.id.name);
+        if (n.id?.type === "Identifier" && !isSanitized(n.init) && flowRefsTaint(n.init, taint)) taint.add(n.id.name);
       },
       AssignmentExpression(n: any) {
-        if (n.left?.type === "Identifier" && !isSanitized(n.right) && refsTaint(n.right, taint)) taint.add(n.left.name);
+        if (n.left?.type === "Identifier" && !isSanitized(n.right) && flowRefsTaint(n.right, taint)) taint.add(n.left.name);
       },
     });
     if (taint.size === before) break;
@@ -400,10 +410,23 @@ function analyzeFn(fn: Node, seed: string[], file: string, ctx: Ctx, depth: numb
       const prop = callee?.type === "MemberExpression" ? (callee.property?.name ?? "") : "";
       const obj = callee?.type === "MemberExpression" ? memberName(callee.object) : "";
 
-      const isCp = CP_BARE.test(bare) || (CP_METHOD.test(prop) && CP_OBJ.test(obj));
-      if (isCp && args.some((a) => tainted(a)))
-        emit("cmd-injection", "CWE-78", "HIGH", "Tool input reaches a shell/command execution sink",
-          `Attacker-influenced MCP input flows into \`${full || bare}(...)\`. A malicious tool call can inject OS commands. Use execFile with a fixed binary + array args, never a shell string.`, n.loc?.start.line);
+      // Shell-form vs argv-form (matches py/mcpscan.py). A shell-form sink runs a COMMAND STRING
+      // (arg0) through a shell, so taint in arg0 injects. An argv-form sink (execFile*/spawn*/fork/
+      // execa(file,args)) passes a fixed program + a separate args array with NO shell, so a tainted
+      // ARGUMENT is inert — only a tainted PROGRAM (arg0) or an explicit `shell:true`/`shell:"<sh>"`
+      // option injects. This kills the sweep's dominant cmd-inj FP (execFile/spawn with a resolved
+      // binary + user data in the args array). The `sh -c <tainted>` pattern is a deliberate,
+      // FP-averse false-negative, exactly as in the Python engine.
+      const cpName = CP_BARE.test(bare) ? bare : ((CP_METHOD.test(prop) && CP_OBJ.test(obj)) ? prop : "");
+      if (cpName) {
+        const shellOpt = args.some((a) => a?.type === "ObjectExpression" &&
+          (a.properties ?? []).some((p: Node) => (p.key?.name ?? p.key?.value) === "shell" &&
+            !(p.value?.type === "Literal" && p.value.value === false)));
+        const hit = shellOpt ? args.some((a) => tainted(a)) : tainted(args[0]);
+        if (hit)
+          emit("cmd-injection", "CWE-78", "HIGH", "Tool input reaches a shell/command execution sink",
+            `Attacker-influenced MCP input flows into \`${full || bare}(...)\`. A malicious tool call can inject OS commands. Use execFile with a fixed binary + array args, never a shell string.`, n.loc?.start.line);
+      }
 
       if ((bare === "eval" || bare === "Function" || /(^|\.)(runInNewContext|runInContext|compileFunction)$/.test(full)) && args.some((a) => tainted(a)))
         emit("code-exec", "CWE-94", "HIGH", "Tool input reaches a code-execution sink",

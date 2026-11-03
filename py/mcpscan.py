@@ -30,7 +30,15 @@ INJECTION = re.compile(
 INVISIBLE = re.compile("[​-‏‪-‮⁠-⁤﻿\U000e0000-\U000e007f]")
 HANDLER_DECO = re.compile(r"(?:^|\.)(tool|call_tool|resource|read_resource|prompt|get_prompt)$")
 SKIP_PARAMS = {"self", "cls", "ctx", "context"}
-SKIP_DIRS = {"node_modules", ".git", "venv", ".venv", "__pycache__", "build", "dist", ".tox", "site-packages"}
+SKIP_DIRS = {"node_modules", ".git", "venv", ".venv", "__pycache__", "build", "dist", ".tox", "site-packages",
+             # test/spec trees: fixtures/seams are not a running server's attack surface (they dominated
+             # the sweep's FP funnel). Mirrors the TS CLI walker's skip set.
+             "test", "tests", "__tests__", "spec", "specs", "e2e"}
+
+
+def _is_test_file(name):
+    """A pytest/unittest file (test_*.py, *_test.py, conftest.py) — not server attack surface."""
+    return name == "conftest.py" or name.startswith("test_") or name.endswith("_test.py")
 MAX_DEPTH = 4
 
 
@@ -654,7 +662,7 @@ def collect_files(path):
     for root, dirs, files in os.walk(path):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for f in files:
-            if f.endswith(".py"):
+            if f.endswith(".py") and not _is_test_file(f):
                 out.append(os.path.join(root, f))
     return out
 

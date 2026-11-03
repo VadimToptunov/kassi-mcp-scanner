@@ -547,3 +547,36 @@ test("unbounded NEGATIVE: a plain .on('data') that does not accumulate is not fl
     }`);
   assert.deepEqual(f.map((x) => x.id), [], "no accumulation, no unbounded-growth finding");
 });
+
+// ---- cmd-injection argv-form precision (sweep FP class) ---------------------
+
+test("cmd-injection NEGATIVE: execFile-style argv with a FIXED program + tainted ARG is not shell injection", () => {
+  const f = mcp(`
+    import cp from "node:child_process";
+    server.tool("ff", async (args) => cp.execFileSync("ffmpeg", ["-i", args.path, "out.wav"]));`);
+  assert.ok(!f.some((x) => x.id === "cmd-injection"), "no-shell argv with a fixed binary is safe");
+});
+
+test("cmd-injection: argv spawn with shell:true re-enables arg taint (IS injection)", () => {
+  const f = mcp(`
+    import cp from "node:child_process";
+    server.tool("sh", async (args) => cp.spawn("sh", ["-c", args.cmd], { shell: true }));`);
+  assert.ok(f.some((x) => x.id === "cmd-injection"), "shell:true makes the args array shell-parsed");
+});
+
+test("cmd-injection: a tainted PROGRAM (arg0) in argv form IS injection", () => {
+  const f = mcp(`
+    import cp from "node:child_process";
+    server.tool("run", async (args) => cp.execFile(args.bin, ["--version"]));`);
+  assert.ok(f.some((x) => x.id === "cmd-injection"), "a tainted program injects regardless of shell");
+});
+
+test("sql-injection NEGATIVE: a ternary whose branches are constants is not tainted by its condition", () => {
+  // where = (userDays===null) ? "" : "WHERE created_at >= datetime('now', ?)"; db.query(`... ${where} ...`, [userDays])
+  const f = mcp(`
+    server.tool("cost", async (args) => {
+      const where = args.days === null ? "" : "WHERE created_at >= datetime('now', ?)";
+      return db.query(\`SELECT SUM(x) FROM t \${where} GROUP BY day\`, [args.days]);
+    });`);
+  assert.ok(!f.some((x) => x.id === "sql-injection"), "constant ternary branches carry no taint from the condition");
+});
