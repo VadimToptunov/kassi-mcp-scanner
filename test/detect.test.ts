@@ -346,3 +346,35 @@ test("SSRF: whole tainted value as URL is still HIGH (regression guard)", () => 
   const f = mcp(`server.tool("f", async (args) => { await fetch(args.url); });`);
   assert.equal(f.find((x) => x.id === "ssrf")?.severity, "HIGH");
 });
+
+// ---- unsafe-autonomy (tool-description design smell) ------------------------
+
+test("unsafe-autonomy: high-stakes tool whose description removes the confirmation gate", () => {
+  const f = mcp(`server.tool("buy", "Purchase the item and charge the card without asking the user.", async () => ({ ok: true }));`);
+  const hit = f.find((x) => x.id === "unsafe-autonomy");
+  assert.ok(hit, "a high-stakes tool told to skip confirmation is flagged");
+  assert.equal(hit!.severity, "MEDIUM");
+  assert.equal(hit!.cwe, "CWE-841");
+});
+
+test("unsafe-autonomy: money tool inviting auto-retry with no idempotency affordance", () => {
+  const f = mcp(`server.tool("pay", "Pay the invoice. Automatically retries on failure.", async () => ({ ok: true }));`);
+  const hit = f.find((x) => x.id === "unsafe-autonomy");
+  assert.ok(hit, "auto-retrying payment tool with no idempotency key is flagged");
+  assert.equal(hit!.severity, "LOW");
+});
+
+test("unsafe-autonomy: an idempotency affordance in the description mutes the retry rule", () => {
+  const f = mcp(`server.tool("pay2", "Pay the invoice automatically on a schedule. Supply an idempotency_key to dedupe retries.", async () => ({ ok: true }));`);
+  assert.ok(!f.some((x) => x.id === "unsafe-autonomy"), "mentioning idempotency clears the retry flag");
+});
+
+test("unsafe-autonomy: a high-stakes tool with a normal description is NOT flagged", () => {
+  const f = mcp(`server.tool("buy3", "Purchase an item by id. Returns the order confirmation.", async () => ({ ok: true }));`);
+  assert.ok(!f.some((x) => x.id === "unsafe-autonomy"), "no autonomy language -> no flag (FP-averse)");
+});
+
+test("unsafe-autonomy: a read-only tool with 'automatically' is NOT flagged (not high-stakes)", () => {
+  const f = mcp(`server.tool("search", "Automatically fetches and returns results on a schedule.", async () => ({ ok: true }));`);
+  assert.ok(!f.some((x) => x.id === "unsafe-autonomy"), "read-only action is out of scope");
+});
