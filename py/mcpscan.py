@@ -95,6 +95,11 @@ def strips_traversal(node):
 
 
 VALIDATOR_METHODS = {"startswith", "endswith", "match", "search", "fullmatch"}
+# A named validator BOUNCER called as a statement (it raises on bad input: `validate_file_path(p)`,
+# `self._require_valid_file_path(p)`, `ensure_within_base(p)`) clears its tainted argument downstream.
+BOUNCER_FUNC = re.compile(r"(validate|require|ensure|verify|guard)", re.I)
+# Path-containment bouncers: `resolved.relative_to(base)` raises ValueError when `resolved` escapes base.
+CONTAINMENT_METHODS = {"relative_to"}
 
 
 def _body_bounces(body):
@@ -153,6 +158,22 @@ def guard_validated(fn, taint):
             for sub in ast.walk(n.test):  # indirect: a boolean var that holds a prior predicate result
                 if isinstance(sub, ast.Name) and sub.id in bool_to_validated:
                     validated |= bool_to_validated[sub.id]
+
+    # Named validator BOUNCERS (`validate_file_path(p)` / `self._require_valid_file_path(p)`) and
+    # path-containment bouncers (`resolved.relative_to(base)`) raise on bad input, so a value they
+    # check is safe downstream even though it is not reassigned (the code-index-mcp / elevenlabs FP).
+    for n in ast.walk(fn):
+        if not isinstance(n, ast.Call):
+            continue
+        if BOUNCER_FUNC.search(dotted(n.func).split(".")[-1]):
+            for a in n.args:
+                for m in ast.walk(a):
+                    if isinstance(m, ast.Name) and m.id in taint:
+                        validated.add(m.id)
+        if isinstance(n.func, ast.Attribute) and n.func.attr in CONTAINMENT_METHODS:
+            for m in ast.walk(n.func.value):
+                if isinstance(m, ast.Name) and m.id in taint:
+                    validated.add(m.id)
     return validated
 
 
@@ -173,8 +194,23 @@ def propagate(fn, sources):
 
 
 def taint_of(fn, sources):
-    taint = propagate(fn, sources)
-    taint -= guard_validated(fn, taint)
+    # Guard-aware: a validated name — and anything derived ONLY from validated/clean values — must never
+    # (re-)enter taint. Subtracting at the end would miss a derived sink arg (`full = join(base, p)` after
+    # `validate(p)`), so we recompute the reachable set with validated names blocked.
+    validated = guard_validated(fn, propagate(fn, sources))
+    if not validated:
+        return propagate(fn, sources)
+    taint = {s for s in sources if s not in validated}
+    for _ in range(6):
+        before = len(taint)
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Assign) and not is_sanitized(n.value) and refs_taint(n.value, taint):
+                for t in n.targets:
+                    taint |= {x.id for x in ast.walk(t) if isinstance(x, ast.Name) and x.id not in validated}
+            elif isinstance(n, ast.AugAssign) and refs_taint(n.value, taint):
+                taint |= {nm for nm in names_in(n.target) if nm not in validated}
+        if len(taint) == before:
+            break
     return taint
 
 

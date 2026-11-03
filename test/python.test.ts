@@ -513,3 +513,35 @@ def read_unguarded(path: str) -> str:
   assert.deepEqual(guarded.map((r) => r.id), [], "indirect guard clears the forwarded path");
   assert.deepEqual(unguarded.map((r) => r.id), ["path-traversal"], "the unguarded twin is still flagged (no over-clearing)");
 });
+
+test("python path-traversal: a named validator BOUNCER clears the checked path; the unguarded twin still flags", { skip }, () => {
+  // code-index-mcp FP: `self._require_valid_file_path(p)` raises on bad input, then `open(join(base,p))`.
+  // The bouncer validates p, so the derived full path is safe; the twin without it must still flag.
+  const rows = run(`
+from mcp.server.fastmcp import FastMCP
+import os
+mcp = FastMCP("fs")
+BASE = "/srv/data"
+
+def _require_valid_file_path(p):
+    if os.path.isabs(p) or ".." in p:
+        raise ValueError("bad path")
+
+@mcp.tool()
+def read_guarded(file_path: str) -> str:
+    _require_valid_file_path(file_path)
+    full = os.path.join(BASE, file_path)
+    with open(full) as f:
+        return f.read()
+
+@mcp.tool()
+def read_unguarded(file_path: str) -> str:
+    full = os.path.join(BASE, file_path)
+    with open(full) as f:
+        return f.read()
+`);
+  const guarded = rows.filter((r: any) => r.handler?.includes("read_guarded"));
+  const unguarded = rows.filter((r: any) => r.handler?.includes("read_unguarded"));
+  assert.deepEqual(guarded.map((r) => r.id), [], "validator bouncer clears the derived path");
+  assert.deepEqual(unguarded.map((r) => r.id), ["path-traversal"], "no over-clearing — unguarded twin still flags");
+});

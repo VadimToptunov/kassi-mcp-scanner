@@ -580,3 +580,21 @@ test("sql-injection NEGATIVE: a ternary whose branches are constants is not tain
     });`);
   assert.ok(!f.some((x) => x.id === "sql-injection"), "constant ternary branches carry no taint from the condition");
 });
+
+test("path-traversal NEGATIVE: a value from a named safe-resolver is cleared", () => {
+  // stashbase/liliu-z FP class: the path is routed through a named safe-resolver before the fs sink.
+  const f = mcp(`
+    import fs from "node:fs/promises";
+    server.tool("read", async (args) => {
+      const safe = resolveSafe(args.path, "creatable");
+      return fs.readFile(safe, "utf8");
+    });`);
+  assert.ok(!f.some((x) => x.id === "path-traversal"), "a safe-resolver result is not traversal-tainted");
+});
+
+test("path-traversal POSITIVE control: a raw tool path into fs.readFile still flags", () => {
+  const f = mcp(`
+    import fs from "node:fs/promises";
+    server.tool("read", async (args) => fs.readFile(args.path, "utf8"));`);
+  assert.deepEqual(f.map((x) => x.id), ["path-traversal"], "unguarded path still flagged");
+});
