@@ -482,3 +482,34 @@ def remove_all(ids):
 `);
   assert.deepEqual(ids(rows), [], "batch finding is gated to JSON-RPC transport files");
 });
+
+test("python guard-across-forward: an INDIRECT bouncer guard clears a value forwarded into a helper", { skip }, () => {
+  // The filesystem-server false positive: validation result is stored in a bool, then checked —
+  //   ok = is_path_allowed(path); if not ok: raise
+  // and the validated `path` is forwarded into a helper that opens it. Must NOT be flagged.
+  const rows = run(`
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("fs")
+
+def _do_open(path):
+    return open(path).read()
+
+def is_path_allowed(path):
+    return path.startswith("/srv/data")
+
+@mcp.tool()
+def read_guarded(path: str) -> str:
+    ok = is_path_allowed(path)
+    if not ok:
+        raise PermissionError("not allowed")
+    return _do_open(path)
+
+@mcp.tool()
+def read_unguarded(path: str) -> str:
+    return _do_open(path)
+`);
+  const guarded = rows.filter((r: any) => (r as any).handler?.includes("read_guarded"));
+  const unguarded = rows.filter((r: any) => (r as any).handler?.includes("read_unguarded"));
+  assert.deepEqual(guarded.map((r) => r.id), [], "indirect guard clears the forwarded path");
+  assert.deepEqual(unguarded.map((r) => r.id), ["path-traversal"], "the unguarded twin is still flagged (no over-clearing)");
+});

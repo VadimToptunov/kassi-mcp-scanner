@@ -473,6 +473,64 @@ test("unbounded batch NEGATIVE: a length cap before iterating clears it", () => 
   assert.deepEqual(f.map((x) => x.id), [], "a batch-length cap makes it bounded");
 });
 
+test("unbounded body NEGATIVE: a stream .push() relay is output, not accumulation", () => {
+  // a gzip/decoder Transform relays decompressed data onward via decoder.push(out) — NOT a growing
+  // in-memory buffer, so it must not be flagged (the Sanoy24/safe-fetch false positive).
+  const f = mcp(`
+    import { Transform } from "node:stream";
+    export function makeDecoder(inner) {
+      const decoder = new Transform();
+      inner.on("data", (out) => decoder.push(out));
+      return decoder;
+    }`);
+  assert.deepEqual(f.map((x) => x.id), [], "stream .push() must not count as buffer growth");
+});
+
+test("unbounded body POSITIVE control: array push accumulation is still flagged", () => {
+  const f = mcp(`
+    export function handleHttp(req, res) {
+      const chunks = [];
+      req.on("data", (chunk) => { chunks.push(chunk); });
+    }`);
+  assert.deepEqual(f.map((x) => x.id), ["unbounded-body"], "real array accumulation stays detected");
+});
+
+test("unbounded batch NEGATIVE: a large tool handler's Array.isArray + .map(x=>({id:x.id})) is not a batch", () => {
+  // the mcp-github-server false positive: in one big CallTool handler, an unrelated Array.isArray on
+  // API response data plus a `.map` that builds objects with an `.id` field must not read as a
+  // JSON-RPC batch. A real batch loop calls a dispatch fn or reads `.method`/`.jsonrpc`.
+  const f = mcp(`
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      const { name, arguments: args } = request.params;
+      const response = await octokit.repos.list();
+      if (Array.isArray(response.data)) {
+        const repos = response.data.map((repo) => ({ id: repo.id, name: repo.name }));
+        return { repos };
+      }
+    });`);
+  assert.ok(!f.some((x) => x.id === "unbounded-batch"), "a tool handler is not a JSON-RPC batch dispatch");
+});
+
+test("TS line mapping: a finding reports the SOURCE line, not the transpiled line", () => {
+  // type-only lines (interface/type) are stripped by the TS->JS transpile and shift every line below;
+  // the finding must still point at the line the user reads.
+  const src = [
+    `import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";`, // 1
+    `import cp from "node:child_process";`,                                 // 2
+    `interface Opts { readonly a: string; readonly b: number; }`,          // 3 (stripped)
+    `type Mode = "x" | "y";`,                                              // 4 (stripped)
+    ``,                                                                     // 5
+    `export function reg(server: McpServer): void {`,                      // 6
+    `  server.tool("sh", async (args: { dir: string }) => cp.exec("ls " + args.dir));`, // 7 = sink
+    `}`,                                                                    // 8
+  ].join("\n");
+  const f = scanSource(src, "server.ts");
+  const hit = f.find((x) => x.id === "cmd-injection");
+  assert.ok(hit, "cmd-injection detected");
+  const sinkLine = src.split("\n").findIndex((l) => l.includes("cp.exec")) + 1;
+  assert.equal(hit!.line, sinkLine, `line should be the source sink line ${sinkLine}, got ${hit!.line}`);
+});
+
 test("unbounded batch NEGATIVE: a non-JSON-RPC Array.isArray+map (CLI/util) is NOT flagged", () => {
   const f = mcp(`
     export function removeAll(ids) {

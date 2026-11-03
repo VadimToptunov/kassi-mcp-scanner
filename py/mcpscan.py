@@ -98,25 +98,53 @@ def _body_bounces(body):
     return False
 
 
+def _validated_in(node, taint):
+    """Tainted names an expression content-validates: a predicate call's args, a validator-method
+    receiver (`x.startswith(...)`), or a membership test (`x in allow`). Presence/None checks: none."""
+    found = set()
+
+    def add(x):
+        for m in ast.walk(x):
+            if isinstance(m, ast.Name) and m.id in taint:
+                found.add(m.id)
+
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            for a in sub.args:
+                add(a)
+            if isinstance(sub.func, ast.Attribute) and sub.func.attr in VALIDATOR_METHODS:
+                add(sub.func.value)
+        elif isinstance(sub, ast.Compare) and any(isinstance(op, (ast.In, ast.NotIn)) for op in sub.ops):
+            add(sub)
+    return found
+
+
 def guard_validated(fn, taint):
-    """Names content-validated by a bouncer guard (predicate / membership); presence/None checks don't count."""
+    """Names content-validated by a bouncer guard (predicate / membership); presence/None checks don't count.
+    Handles the INDIRECT form too, where the predicate result is stored and then checked:
+        ok = is_path_allowed(path)   # validates `path`
+        if not ok: raise             # test references `ok`, not `path`
+    so a value validated before being forwarded into a called function is cleared (the filesystem-server FP)."""
+    # map a boolean-ish variable to the tainted names its defining expression validates
+    bool_to_validated = {}
+    for n in ast.walk(fn):
+        tgt = val = None
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+            tgt, val = n.targets[0].id, n.value
+        elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and n.value is not None:
+            tgt, val = n.target.id, n.value
+        if tgt is not None and val is not None:
+            names = _validated_in(val, taint)
+            if names:
+                bool_to_validated[tgt] = names
+
     validated = set()
-
-    def add(node):
-        for n in ast.walk(node):
-            if isinstance(n, ast.Name) and n.id in taint:
-                validated.add(n.id)
-
     for n in ast.walk(fn):
         if isinstance(n, ast.If) and _body_bounces(n.body):
-            for sub in ast.walk(n.test):
-                if isinstance(sub, ast.Call):
-                    for a in sub.args:
-                        add(a)
-                    if isinstance(sub.func, ast.Attribute) and sub.func.attr in VALIDATOR_METHODS:
-                        add(sub.func.value)
-                elif isinstance(sub, ast.Compare) and any(isinstance(op, (ast.In, ast.NotIn)) for op in sub.ops):
-                    add(sub)
+            validated |= _validated_in(n.test, taint)
+            for sub in ast.walk(n.test):  # indirect: a boolean var that holds a prior predicate result
+                if isinstance(sub, ast.Name) and sub.id in bool_to_validated:
+                    validated |= bool_to_validated[sub.id]
     return validated
 
 

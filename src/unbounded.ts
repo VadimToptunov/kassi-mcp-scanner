@@ -55,18 +55,59 @@ const GROW_METHOD = /^(push|concat|append)$/;
 // the iterated source of a request-body read (vs a file stream / DB cursor, which is out of scope)
 const REQ_SOURCE = /(^|\.)(req|request|incoming|socket|body|conn|stream|rawbody|raw)$/i;
 
-/** A statement/scope that GROWS an accumulator: `body += chunk`, `chunks.push(c)`, `buf.concat(c)`. */
-function growsBuffer(scope: Node): boolean {
+// A `stream.push(x)` is the Readable/Transform output API (relaying data ONWARD), not accumulation
+// into an in-memory buffer. Counting it as growth false-flags passthrough/decoder relays (e.g. a gzip
+// `new Transform` whose `transform()` does `decoder.push(out)`). We collect identifiers bound to a
+// stream object and exclude pushes to them, and exclude `this.push(...)` inside a Transform subclass.
+const STREAM_CTOR = /(^|\.)(Transform|Readable|Writable|Duplex|PassThrough)$/;
+const STREAM_FACTORY = /(^|\.)(createGunzip|createGzip|createInflate|createInflateRaw|createDeflate|createDeflateRaw|createBrotliDecompress|createBrotliCompress|createUnzip|PassThrough)$/;
+
+/** Identifiers in a file bound to a stream object (`const x = new Transform()` / `zlib.createGunzip()`).
+ *  A `.push()` to one of these is stream output, not buffer accumulation. Computed per file so a push
+ *  in a nested callback still sees a stream declared in the enclosing function. */
+function collectStreamIdents(ast: Node): Set<string> {
+  const s = new Set<string>();
+  const fromInit = (name: string | undefined, init: Node | undefined) => {
+    if (!name || !init) return;
+    if (init.type === "NewExpression") {
+      const c = init.callee?.type === "Identifier" ? init.callee.name : memberName(init.callee);
+      if (STREAM_CTOR.test(c)) s.add(name);
+    } else if (init.type === "CallExpression") {
+      const c = memberName(init.callee) || (init.callee?.type === "Identifier" ? init.callee.name : "");
+      if (STREAM_FACTORY.test(c)) s.add(name);
+    }
+  };
+  walk.simple(ast as any, {
+    VariableDeclarator(n: any) { if (n.id?.type === "Identifier") fromInit(n.id.name, n.init); },
+    AssignmentExpression(n: any) { if (n.left?.type === "Identifier") fromInit(n.left.name, n.right); },
+  });
+  return s;
+}
+
+/** Is this `obj.push(...)`-style grow call actually a stream output (so NOT accumulation)? */
+function isStreamOutput(call: Node, streams: Set<string>): boolean {
+  const obj = call.callee?.object;
+  if (!obj) return false;
+  if (obj.type === "ThisExpression") return true; // this.push(...) inside a Transform subclass
+  if (obj.type === "Identifier") return streams.has(obj.name);
+  return false;
+}
+
+/** A statement/scope that GROWS an accumulator: `body += chunk`, `chunks.push(c)`, `buf.concat(c)`.
+ *  A `.push`/`.concat`/`.append` onto a known stream object is excluded (stream output, not growth). */
+function growsBuffer(scope: Node, streams: Set<string>): boolean {
   let grows = false;
   walk.simple(scope as any, {
     AssignmentExpression(n: any) { if (n.operator === "+=") grows = true; },
-    CallExpression(n: any) { if (n.callee?.type === "MemberExpression" && GROW_METHOD.test(n.callee.property?.name ?? "")) grows = true; },
+    CallExpression(n: any) {
+      if (n.callee?.type === "MemberExpression" && GROW_METHOD.test(n.callee.property?.name ?? "") && !isStreamOutput(n, streams)) grows = true;
+    },
   });
   return grows;
 }
 
 /** `emitter.on("data", cb)` / `.addListener("data", cb)` whose callback accumulates. */
-function dataListenerGrows(fn: Node): boolean {
+function dataListenerGrows(fn: Node, streams: Set<string>): boolean {
   let hit = false;
   walk.simple(fn as any, {
     CallExpression(n: any) {
@@ -75,7 +116,7 @@ function dataListenerGrows(fn: Node): boolean {
       const ev = n.arguments?.[0];
       if (ev?.type !== "Literal" || ev.value !== "data") return;
       const cb = n.arguments?.[1];
-      if (cb && (cb.type === "ArrowFunctionExpression" || cb.type === "FunctionExpression") && growsBuffer(cb.body)) hit = true;
+      if (cb && (cb.type === "ArrowFunctionExpression" || cb.type === "FunctionExpression") && growsBuffer(cb.body, streams)) hit = true;
     },
   });
   return hit;
@@ -83,11 +124,11 @@ function dataListenerGrows(fn: Node): boolean {
 
 /** `for await (const chunk of req) { body += chunk }` — streaming read of a REQUEST that accumulates.
  *  The source must look like a request stream; a file stream / DB cursor is a different threat model. */
-function forAwaitGrows(fn: Node): boolean {
+function forAwaitGrows(fn: Node, streams: Set<string>): boolean {
   let hit = false;
   walk.simple(fn as any, {
     ForOfStatement(n: any) {
-      if (!n.await || !growsBuffer(n.body)) return;
+      if (!n.await || !growsBuffer(n.body, streams)) return;
       const src = n.right?.type === "Identifier" ? n.right.name : memberName(n.right);
       if (REQ_SOURCE.test(src)) hit = true;
     },
@@ -98,7 +139,10 @@ function forAwaitGrows(fn: Node): boolean {
 // JSON-RPC-batch dispatch: an element handed to a message handler, or a member read that marks it as
 // a JSON-RPC message (.method / .jsonrpc / .id / .params).
 const DISPATCH_FN = /(handle|dispatch|process|onmessage|handlemessage|route|execute|_onrequest|onrequest)/i;
-const RPC_MEMBER = /^(method|jsonrpc|id|params)$/;
+// A JSON-RPC message is identified by `.method` / `.jsonrpc`; `.id` and `.params` are far too common
+// (every object with an id, every `request.params` destructure) and conflated an ordinary `.map(x =>
+// ({ id: x.id }))` inside a large tool handler with a transport batch (the mcp-github-server FP).
+const RPC_MEMBER = /^(method|jsonrpc)$/;
 
 function looksLikeDispatch(scope: Node): boolean {
   let hit = false;
@@ -171,10 +215,11 @@ export function scanUnbounded(parsed: Array<{ file: string; ast: Node; source?: 
   const out: Finding[] = [];
   for (const { file, ast, source } of parsed) {
     const isRpcFile = !source || RPC_FILE.test(source);
+    const streams = collectStreamIdents(ast); // identifiers bound to stream objects (push target ≠ growth)
     for (const fn of allFns(ast)) {
       if (hasSizeCap(fn)) continue; // a cap is present somewhere in this function → bounded
       const line = fn.loc?.start.line;
-      if ((dataListenerGrows(fn) || forAwaitGrows(fn)) && !readsFileStream(fn)) {
+      if ((dataListenerGrows(fn, streams) || forAwaitGrows(fn, streams)) && !readsFileStream(fn)) {
         out.push({ id: "unbounded-body", cwe: "CWE-770", severity: "HIGH",
           title: "Request body is accumulated without a size cap",
           detail: "An HTTP transport reads and accumulates a request body (`.on(\"data\", …)` / `for await (… of req)`) with no byte/length limit enforced before it is buffered or parsed. A single large request exhausts server memory (cf. MCP TypeScript SDK GHSA-f897-62hf-6gxq). Cap the accumulated size and reject once it is exceeded (e.g. `raw-body`/`getRawBody` with a `limit`, or a running byte count checked against a maximum).",
