@@ -85,3 +85,7 @@ with a notice (the TS/JS scan is unaffected).
 - Code-level data flow only; it does not model prompt-injection *semantics* beyond the tool-poisoning
   string/unicode heuristics. Resolution is unique-name based (ambiguous names are skipped, so a very
   generic method name shared by many classes won't be followed).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
