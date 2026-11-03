@@ -281,6 +281,33 @@ const NET_METHOD = /^(get|post|put|patch|delete|request|fetch|head)$/;
 const SQL_METHOD = /^(query|execute|unsafe|raw)$/;
 const SQL_OBJ = /(^|\.)(db|database|conn|connection|pool|client|sequelize|knex|sql|prisma|pg|mysql|sqlite|cursor)$/i;
 
+// prototype pollution (CWE-1321): a RECURSIVE deep-merge / nested-set fed attacker data walks the input's
+// keys into the target, so a `__proto__` key reaches Object.prototype. Scoped to the genuinely-recursive
+// helpers (not shallow Object.assign / Map.set / res.set, which would be noise).
+const MERGE_SINK = /^(merge|mergeWith|deepMerge|deepmerge|defaultsDeep|mergeDeep|setWith)$/;
+// ReDoS (CWE-1333): string methods whose first arg is the regex/pattern.
+const REDOS_PAT_METHOD = /^(match|matchAll|search|replace|replaceAll|split)$/;
+// A regex literal with catastrophic backtracking: a quantified group that itself contains a quantifier,
+// or an alternation of the same atom under a quantifier — `(a+)+`, `(a*)*`, `(.*)*`, `(a|a)*`.
+const EVIL_REGEX = /\([^()]*[+*][^()]*\)[+*?]|\(([^()|]+)\|\1\)[+*]/;
+
+/** True when a regex LITERAL argument has an evil (catastrophic-backtracking) shape. */
+function isEvilRegexLiteral(n: Node | undefined): boolean {
+  return !!n && n.type === "Literal" && !!n.regex && EVIL_REGEX.test(n.regex.pattern ?? "");
+}
+/** A function that defends against prototype pollution anywhere (so merge/set sinks in it are suppressed):
+ *  a `__proto__`/`constructor`/`prototype` key check, a null-prototype object, a Map, or hasOwnProperty. */
+function hasProtoGuard(fn: Node): boolean {
+  let g = false;
+  walk.simple(fn as any, {
+    Literal(x: any) { if (typeof x.value === "string" && /^(__proto__|constructor|prototype)$/.test(x.value)) g = true; },
+    Identifier(x: any) { if (/^(hasOwnProperty|getOwnPropertyNames|freeze)$/.test(x.name)) g = true; },
+    NewExpression(x: any) { if ((x.callee?.name ?? memberName(x.callee)) === "Map") g = true; },
+    CallExpression(x: any) { if (memberName(x.callee) === "Object.create" && x.arguments?.[0]?.type === "Literal" && x.arguments[0].value === null) g = true; },
+  });
+  return g;
+}
+
 function isConcatOrTemplate(n: Node | undefined): boolean {
   return !!n && (n.type === "TemplateLiteral" || (n.type === "BinaryExpression" && n.operator === "+"));
 }
@@ -376,6 +403,7 @@ function analyzeFn(fn: Node, seed: string[], file: string, ctx: Ctx, depth: numb
   const ssrfTaint = new Set<string>([...taint].filter((n) => !ssrfSafe.has(n)));
   for (const w of ssrfWeak) ssrfTaint.add(w);
   const sqlBuilt = strBuiltFromTaint(fn, taint);
+  const protoGuarded = hasProtoGuard(fn); // a __proto__/constructor key guard anywhere suppresses merge sinks
   const pathOnly = new Set<string>(seedPathOnly);
   for (const n of urlPathOnlyNames(fn, taint)) pathOnly.add(n);
   const where = ctx.label + (via ? ` (via ${via})` : "");
@@ -455,6 +483,24 @@ function analyzeFn(fn: Node, seed: string[], file: string, ctx: Ctx, depth: numb
         emit("sql-injection", "CWE-89", "HIGH", "Tool input is interpolated into a raw SQL query",
           `Attacker-influenced MCP input is concatenated/templated into \`${full}(...)\` instead of a parameterized query — SQL injection. Use bound parameters.`, n.loc?.start.line);
 
+      // prototype pollution (CWE-1321): attacker data into a recursive deep-merge / nested-set.
+      if ((MERGE_SINK.test(prop) || MERGE_SINK.test(bare) || (/^set$/.test(prop) && /(^|\.)(_|lodash)$/.test(obj)))
+          && !protoGuarded && args.some((a) => tainted(a)))
+        emit("prototype-pollution", "CWE-1321", "HIGH", "Tool input flows into a recursive merge/set",
+          `Attacker-influenced MCP input is a source/path for \`${full || bare}(...)\` (recursive deep-merge / nested set). A payload with a \`__proto__\`/\`constructor\` key pollutes Object.prototype. Reject those keys, or use a null-prototype object / Map.`, n.loc?.start.line);
+
+      // ReDoS (CWE-1333): attacker controls the regex PATTERN (arg0 of a pattern method / RegExp()).
+      if ((bare === "RegExp" || /(^|\.)RegExp$/.test(full)) && tainted(args[0]))
+        emit("redos", "CWE-1333", "HIGH", "Tool input is compiled into a regular expression",
+          `Attacker-influenced MCP input is the pattern of \`${full || bare}(...)\` — a crafted pattern (catastrophic backtracking or a huge pattern) hangs the event loop (ReDoS). Validate/bound the pattern, or don't build regexes from tool input.`, n.loc?.start.line);
+      else if (REDOS_PAT_METHOD.test(prop) && tainted(args[0]))
+        emit("redos", "CWE-1333", "HIGH", "Tool input is used as a regular-expression pattern",
+          `Attacker-influenced MCP input is the pattern passed to \`${full}(...)\` — a crafted regex causes catastrophic backtracking (ReDoS). Treat tool input as a literal (escape it) rather than a pattern.`, n.loc?.start.line);
+      // ReDoS (MEDIUM): tainted INPUT tested against a statically catastrophic regex literal.
+      else if (REDOS_PAT_METHOD.test(prop) && refsTaint(callee?.object, taint) && isEvilRegexLiteral(args[0]))
+        emit("redos", "CWE-1333", "MEDIUM", "Tool input is matched against a catastrophic regex",
+          `Attacker-influenced MCP input is matched by \`${full}(...)\` against a regex with nested quantifiers (catastrophic backtracking) — a crafted input hangs the event loop (ReDoS). Rewrite the regex to avoid nested quantifiers, or cap input length.`, n.loc?.start.line);
+
       // cross-function forward: a tainted arg handed to a resolvable function -> follow it.
       // but NOT into a guard/validator (validatePath/sanitize/…): its internals legitimately
       // handle the raw path (realpath/readdir) — following in would re-flag the guard itself.
@@ -482,6 +528,10 @@ function analyzeFn(fn: Node, seed: string[], file: string, ctx: Ctx, depth: numb
       if (/(^|\.)Script$/.test(memberName(n.callee)) && (n.arguments ?? []).some((a: Node) => a && refsTaint(a, taint)))
         emit("code-exec", "CWE-94", "HIGH", "Tool input reaches a code-execution sink",
           `Attacker-influenced MCP input flows into \`new vm.Script(...)\` — arbitrary code execution.`, n.loc?.start.line);
+      // ReDoS: new RegExp(taintedPattern) — attacker controls the compiled regex.
+      if (/(^|\.)RegExp$/.test(memberName(n.callee)) && tainted((n.arguments ?? [])[0]))
+        emit("redos", "CWE-1333", "HIGH", "Tool input is compiled into a regular expression",
+          `Attacker-influenced MCP input is the pattern of \`new RegExp(...)\` — a crafted pattern (catastrophic backtracking) hangs the event loop (ReDoS). Validate/bound the pattern, or don't build regexes from tool input.`, n.loc?.start.line);
     },
   });
 

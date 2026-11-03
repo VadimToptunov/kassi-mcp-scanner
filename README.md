@@ -25,6 +25,8 @@ Docker needed.
 | `unbounded-body` | CWE-770 | an HTTP transport accumulates a request body (`.on("data")` / `for await` / async stream) with no size cap before buffering/parsing |
 | `unbounded-batch` | CWE-770 | a JSON-RPC batch (`Array.isArray`/`isinstance(...,list)`) is dispatched element-by-element with no length cap |
 | `sql-injection` | CWE-89 | tainted value interpolated into a raw query (parameterized is safe) |
+| `prototype-pollution` | CWE-1321 | **JS**: tool input into a recursive deep-merge / nested-set (`merge`/`defaultsDeep`/`_.set`) with no `__proto__`/`constructor` key guard |
+| `redos` | CWE-1333 | tool input compiled into a regex (`new RegExp`/`re.compile`) or used as the pattern of `match`/`search`/`sub`… = HIGH; tool input matched against a catastrophic-backtracking literal = MEDIUM |
 | `deserialization` | CWE-502 | **Py**: `pickle`/`dill`/`marshal` loads, or `yaml.load` without SafeLoader, on tainted input |
 | `tool-poisoning` | CWE-94 | prompt-injection text or invisible unicode hidden in a tool's **description/docstring** |
 | `secret-exposure` | CWE-200 | the whole `process.env` / `os.environ` object used (not a single named var) |

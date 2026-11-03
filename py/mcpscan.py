@@ -98,6 +98,9 @@ VALIDATOR_METHODS = {"startswith", "endswith", "match", "search", "fullmatch"}
 # A named validator BOUNCER called as a statement (it raises on bad input: `validate_file_path(p)`,
 # `self._require_valid_file_path(p)`, `ensure_within_base(p)`) clears its tainted argument downstream.
 BOUNCER_FUNC = re.compile(r"(validate|require|ensure|verify|guard)", re.I)
+# ReDoS: `re.<fn>(pattern, ...)` whose FIRST arg is the pattern (a compiled `rx.match(s)` has arg0 = the
+# string, not the pattern, so it is deliberately excluded — the attacker must control the PATTERN here).
+RE_PATTERN_FUNC = re.compile(r"^(compile|match|fullmatch|search|sub|subn|split|findall|finditer)$")
 # Path-containment bouncers: `resolved.relative_to(base)` raises ValueError when `resolved` escapes base.
 CONTAINMENT_METHODS = {"relative_to"}
 
@@ -507,6 +510,11 @@ def analyze_fn(fn, seed, file, ctx, depth, visited, via):
                 if not safe:
                     emit("deserialization", "CWE-502", "HIGH", "Tool input is parsed with unsafe yaml.load",
                          "Attacker-influenced MCP input goes to `yaml.load(...)` without SafeLoader — can execute arbitrary Python. Use `yaml.safe_load`.", n.lineno)
+
+            # ReDoS (CWE-1333): attacker controls the regex PATTERN (first arg of re.compile/match/search/...).
+            if RE_PATTERN_FUNC.match(last) and name.split(".")[0] in ("re", "regex") and args and refs_taint(args[0], taint):
+                emit("redos", "CWE-1333", "HIGH", "Tool input is used as a regular-expression pattern",
+                     f"Attacker-influenced MCP input is the pattern of `{name}(...)` — a crafted regex causes catastrophic backtracking (ReDoS), hanging the worker. Treat tool input as a literal (re.escape) rather than a pattern.", n.lineno)
 
             # cross-function forward (not into guards)
             if not is_sanitized(n):

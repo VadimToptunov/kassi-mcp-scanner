@@ -545,3 +545,24 @@ def read_unguarded(file_path: str) -> str:
   assert.deepEqual(guarded.map((r) => r.id), [], "validator bouncer clears the derived path");
   assert.deepEqual(unguarded.map((r) => r.id), ["path-traversal"], "no over-clearing — unguarded twin still flags");
 });
+
+test("python redos: re.search with a tool-controlled PATTERN is flagged; a fixed pattern is not", () => {
+  const vuln = run(`
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("x")
+import re
+@mcp.tool()
+def grep(pattern: str, text: str) -> bool:
+    return re.search(pattern, text) is not None
+`);
+  assert.ok(vuln.some((r) => r.id === "redos"), "tool-controlled regex pattern flagged");
+  const clean = run(`
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("x")
+import re
+@mcp.tool()
+def grep(text: str) -> bool:
+    return re.search(r"^[a-z]+$", text) is not None
+`);
+  assert.ok(!clean.some((r) => r.id === "redos"), "a fixed pattern on tool input is not ReDoS");
+});

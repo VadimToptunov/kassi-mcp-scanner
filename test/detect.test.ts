@@ -598,3 +598,52 @@ test("path-traversal POSITIVE control: a raw tool path into fs.readFile still fl
     server.tool("read", async (args) => fs.readFile(args.path, "utf8"));`);
   assert.deepEqual(f.map((x) => x.id), ["path-traversal"], "unguarded path still flagged");
 });
+
+// ---- prototype pollution (CWE-1321) ----------------------------------------
+
+test("prototype-pollution: tool input into a recursive deep-merge is HIGH", () => {
+  const f = mcp(`
+    import { merge } from "lodash";
+    server.tool("cfg", async (args) => { const out = {}; merge(out, args.patch); return out; });`);
+  const hit = f.find((x) => x.id === "prototype-pollution");
+  assert.ok(hit && hit.severity === "HIGH", "deep-merge of tool input flagged");
+});
+
+test("prototype-pollution NEGATIVE: a __proto__ key guard suppresses the merge sink", () => {
+  const f = mcp(`
+    import { merge } from "lodash";
+    server.tool("cfg", async (args) => {
+      if (args.key === "__proto__" || args.key === "constructor") throw new Error("blocked");
+      const out = {}; merge(out, args.patch); return out;
+    });`);
+  assert.ok(!f.some((x) => x.id === "prototype-pollution"), "a proto-key guard clears it");
+});
+
+test("prototype-pollution NEGATIVE: a shallow Object.assign / Map.set is not flagged", () => {
+  const f = mcp(`
+    server.tool("m", async (args) => { const m = new Map(); m.set(args.k, args.v); return Object.assign({}, { a: 1 }); });`);
+  assert.ok(!f.some((x) => x.id === "prototype-pollution"), "non-recursive set/assign are out of scope");
+});
+
+// ---- ReDoS (CWE-1333) -------------------------------------------------------
+
+test("redos: new RegExp(toolInput) is HIGH (attacker controls the pattern)", () => {
+  const f = mcp(`server.tool("rx", async (args) => new RegExp(args.pattern).test("x"));`);
+  assert.ok(f.some((x) => x.id === "redos" && x.severity === "HIGH"), "user-built regex flagged");
+});
+
+test("redos: tool input as the pattern arg of .match is HIGH", () => {
+  const f = mcp(`server.tool("find", async (args) => "abc".match(args.q));`);
+  assert.ok(f.some((x) => x.id === "redos" && x.severity === "HIGH"), "tainted pattern arg flagged");
+});
+
+test("redos MEDIUM: tool input matched against a catastrophic-backtracking literal", () => {
+  const f = mcp(`server.tool("v", async (args) => args.s.match(/(a+)+$/));`);
+  const hit = f.find((x) => x.id === "redos");
+  assert.ok(hit && hit.severity === "MEDIUM", "evil static regex on tainted input flagged MEDIUM");
+});
+
+test("redos NEGATIVE: a fixed regex on tool input is not flagged", () => {
+  const f = mcp(`server.tool("v", async (args) => new RegExp("^[a-z]+$").test(args.s));`);
+  assert.ok(!f.some((x) => x.id === "redos"), "a constant pattern is safe");
+});
