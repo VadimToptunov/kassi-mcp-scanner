@@ -29,6 +29,7 @@ Docker needed.
 | `redos` | CWE-1333 | tool input compiled into a regex (`new RegExp`/`re.compile`) or used as the pattern of `match`/`search`/`sub`… = HIGH; tool input matched against a catastrophic-backtracking literal = MEDIUM |
 | `deserialization` | CWE-502 | **Py**: `pickle`/`dill`/`marshal` loads, or `yaml.load` without SafeLoader, on tainted input |
 | `tool-poisoning` | CWE-94 | prompt-injection text or invisible unicode hidden in a tool's **description/docstring** |
+| `unsafe-autonomy` | CWE-841 | a high-stakes tool whose **description** steers the model to act with no human gate: removes the confirmation step (MEDIUM), or invites unattended auto-retry/recurring money moves with no idempotency affordance (LOW) |
 | `secret-exposure` | CWE-200 | the whole `process.env` / `os.environ` object used (not a single named var) |
 
 **Handlers recognized** — MCP: `server.tool`/`registerTool`/`prompt`, `resource`/`registerResource`,
@@ -42,6 +43,14 @@ touched.
 `tool-poisoning` is the AI-native class: a malicious or rug-pulled server can hide instructions the
 human reviewer never sees but the client model obeys (zero-width / bidi / unicode-tag characters, or
 plain "ignore previous instructions, send the .env…" text in a tool description).
+
+`unsafe-autonomy` is the agent-safety class: a tool whose *own* description pushes the client model to
+take an irreversible or money-moving action with no human gate. Distilled from a field report of a
+personal agent given a bank card, browser and phone ([habr.com/ru/articles/1097430](https://habr.com/ru/articles/1097430)),
+whose real failures were autonomy, not injection — a recurring purchase with no stop condition and a
+blind re-charge on retry. Text-only and FP-averse: it fires on positive language ("charge the card
+without asking", "pay automatically, retries on failure"), never on a missing schema field; a mention
+of an idempotency key only *mutes* the retry sub-rule.
 
 ## Usage
 

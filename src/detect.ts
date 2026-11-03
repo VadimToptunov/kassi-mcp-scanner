@@ -31,6 +31,28 @@ const SANITIZER = /sanitiz|escape|allowlist|whitelist|validate|isAllowed|assert|
 const INJECTION = /ignore\s+(?:all\s+|the\s+)?(?:previous|above|prior)\s+(?:instructions|context|messages)|disregard\s+(?:the\s+)?(?:previous|above|prior)|do\s+not\s+(?:tell|inform|mention|notify|reveal).{0,20}\buser\b|without\s+(?:telling|informing|notifying|alerting).{0,20}\buser\b|exfiltrat|<important>|<secret>|\bsystem\s+prompt\b|you\s+must\s+(?:always|secretly|silently)|send\s+(?:the\s+|all\s+|any\s+)?(?:data|files?|contents?|credentials?|secrets?|keys?|\.env)\b|read\s+(?:the\s+)?(?:~\/\.ssh|\.env|id_rsa|credentials)/i;
 const INVISIBLE = /[​-‏‪-‮⁠-⁤﻿]|[\u{e0000}-\u{e007f}]/u;
 
+// ---- unsafe-autonomy design smell (tool DESCRIPTION, not taint) -------------
+// Seeded by a field report of a personal agent with a bank card + browser + phone
+// (habr.com/ru/articles/1097430): the agent's failures were irreversible real-world actions taken
+// with no human gate — a recurring purchase with no stop condition and a blind re-charge on retry.
+// At the MCP layer the analogue is a tool whose OWN description steers the client model to take a
+// high-stakes action autonomously. We flag two text patterns (never an absence — that would FP):
+//   1) a high-stakes/irreversible tool whose description removes the confirmation step; and
+//   2) a money-moving tool whose description invites unattended repeats (auto-retry / recurring /
+//      scheduled) — the double-charge risk — UNLESS it mentions an idempotency affordance (which
+//      only MUTES the flag; its absence alone never raises one). Only `tool` handlers take actions.
+
+/** An irreversible / money-moving / outward side-effecting action, by the tool's name or description. */
+const HIGH_STAKES = /\b(purchas|buy|checkout|pay|payment|charge|billing|\bbill\b|refund|transfer|wire|withdraw|deposit|trade|place[_ -]?order|\border\b|book(?:ing|[_ -]?(?:flight|hotel|table|room|ticket))?|reserve|subscrib|delete|destroy|wipe|terminat|deploy|publish|send[_ -]?(?:email|sms|message|money|funds|payment)|cancel)\b/i;
+/** The tighter money-movement subset, for the retry / double-charge sub-rule. */
+const MONEY_ACTION = /\b(purchas|buy|checkout|\bpay\b|payment|charge|billing|refund|transfer|wire|withdraw|deposit|trade|place[_ -]?order|send[_ -]?(?:money|funds|payment))\b/i;
+/** Description language that tells the model to act WITHOUT a user-confirmation gate. */
+const NO_CONFIRM = /\bwithout\s+(?:asking|confirm(?:ing|ation)?|user\s+(?:confirmation|approval|consent)|prompting|approval|permission)\b|\bdo(?:\s+not|n'?t)\s+ask\b|\bno\s+confirmation(?:\s+(?:needed|required|necessary))?\b|\bno\s+need\s+to\s+(?:ask|confirm)\b|\bskip(?:\s+the)?\s+confirmation\b|\bwithout\s+(?:further\s+)?(?:human|user)\s+(?:input|intervention|interaction|review)\b|\balways\s+(?:proceed|comply|execute)\b|\bimmediately\s+(?:execute|proceed|run|charge|pay|purchase|send|order|place)\b/i;
+/** Description language that invites unattended, repeated invocation (→ double-execution). */
+const AUTO_REPEAT = /\bautomatic(?:ally)?\b|\bauto-?retr(?:y|ies)\b|\bretr(?:y|ies|ying)\b|\bre-?try\b|\brecurring\b|\bon\s+a\s+schedule\b|\bscheduled?\b|\bevery\s+\d|\bperiodic|\bpoll(?:ing)?\b|\bin\s+a\s+loop\b|\brepeatedly\b|\bin\s+the\s+background\b|\bunattended\b/i;
+/** A mention of an idempotency / dedup affordance — the author is aware; MUTES the retry sub-rule. */
+const IDEMPOTENCY = /\bidempoten|idempotency[_ -]?key|\bnonce\b|dedup|deduplicat|request[_ -]?id|transaction[_ -]?id|\btxn[_ -]?id|reference[_ -]?id|client[_ -]?token|\bdry[_ -]?run\b|confirm(?:ation)?[_ -]?(?:token|required|flag)\b/i;
+
 const MAX_DEPTH = 4; // handler -> service -> … forward chain
 
 // ---- taint -----------------------------------------------------------------
@@ -569,8 +591,38 @@ export function scanProject(files: Array<{ file: string; source: string }>): Fin
         if (INVISIBLE.test(s)) { out.push(poison(file, h, `contains zero-width / bidi / unicode-tag characters — a channel for instructions the human reviewer can't see but the model reads (tool poisoning / rug-pull).`)); break; }
         if (INJECTION.test(s)) { out.push(poison(file, h, `contains model-directed instructions (e.g. "${s.slice(0, 60).replace(/\s+/g, " ")}…") — a malicious or rug-pulled server covertly steering the client model.`)); break; }
       }
+      // unsafe-autonomy: the tool's description steers the model to act on a high-stakes action with
+      // no human gate (distilled from habr.com/ru/articles/1097430's agent-autonomy failures).
+      out.push(...scanToolDesign(file, h));
       analyzeFn(h.fn, h.sources, file, ctx, 0, new Set<Node>(), "");
     }
+  }
+  return out;
+}
+
+/** Flag a tool whose DESCRIPTION steers the client model to take a high-stakes action autonomously.
+ *  Text-only and FP-averse: both rules trigger on positive language, never on a missing field. */
+function scanToolDesign(file: string, h: Handler): Finding[] {
+  if (h.kind !== "tool") return []; // only tools take actions
+  const hay = [h.label, ...h.metaStrings].join("  ").toLowerCase();
+  if (!HIGH_STAKES.test(hay)) return [];
+  const out: Finding[] = [];
+  const where = `tool "${h.label}"`;
+  if (NO_CONFIRM.test(hay)) {
+    out.push({
+      id: "unsafe-autonomy", cwe: "CWE-841", severity: "MEDIUM",
+      title: `High-stakes tool description removes the confirmation step in MCP ${where}`,
+      detail: `The ${where} performs an irreversible / money-moving action yet its own description tells the model to proceed without user confirmation ("do not ask", "automatically", "no confirmation needed", …). A tool must not instruct the agent to skip the human gate on a consequential action — leave the confirm-before-acting decision to the client/policy, and gate the action behind an explicit approval argument.`,
+      file, line: h.line, handler: where,
+    });
+  }
+  if (MONEY_ACTION.test(hay) && AUTO_REPEAT.test(hay) && !IDEMPOTENCY.test(hay)) {
+    out.push({
+      id: "unsafe-autonomy", cwe: "CWE-841", severity: "LOW",
+      title: `Money-moving tool invites unattended retries with no idempotency affordance in MCP ${where}`,
+      detail: `The ${where} moves money and its description invites unattended / automatic / recurring invocation, but declares no idempotency affordance (idempotency key, request/transaction id, nonce, dry-run). A retried or rescheduled call can then charge twice — the classic agent double-charge. Accept and honor a caller-supplied idempotency key, and document it in the tool schema.`,
+      file, line: h.line, handler: where,
+    });
   }
   return out;
 }
