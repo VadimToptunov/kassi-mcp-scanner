@@ -87,8 +87,13 @@ function isSanitized(node: Node | undefined): boolean {
 
 function stripsTraversal(node: Node | undefined): boolean {
   const n = unwrapAwait(node);
-  if (!n || n.type !== "CallExpression") return false;
-  return /(^|\.)basename$/.test(memberName(n.callee));
+  if (!n) return false;
+  if (n.type === "CallExpression" && /(^|\.)basename$/.test(memberName(n.callee))) return true;
+  // basename() applied inside the path expression (`"/data/" + basename(name)`, `path.join(base,
+  // basename(name))`) strips `../` from the tainted part too.
+  let found = false;
+  walk.simple(n as any, { CallExpression(c: any) { if (/(^|\.)basename$/.test(memberName(c.callee))) found = true; } });
+  return found;
 }
 
 /** Does this statement guarantee the path exits (throw / return / process.exit)? */
@@ -104,24 +109,45 @@ function bounces(node: Node | undefined): boolean {
  *  return`, `if (RE.test(x)) throw`, `if (!allow.has(host)) throw`. A bare presence/null check does NOT
  *  count (clearing it would miss real injection). Flow-insensitive, like the sanitizer-wrapper handling. */
 const VALIDATOR_METHOD = /^(startsWith|endsWith|includes|match|test|has|search|indexOf|every|some)$/;
-function guardValidatedNames(fn: Node, taint: Set<string>): Set<string> {
+/** Tainted names a single `if (...) throw/return` test CONTENT-validates: the args of a predicate or
+ *  `allow.has(x)` / `RE.test(x)` call, and the receiver of `x.startsWith(B)`. A bare presence/null check
+ *  yields none. Shared by the general guard-by-throw clearing and the SSRF allowlist handling. */
+function contentValidatedInTest(test: Node, taint: Set<string>): Set<string> {
   const validated = new Set<string>();
   const addNames = (node: Node | undefined) => {
     if (!node) return;
     walk.simple(node as any, { Identifier(x: any) { if (taint.has(x.name)) validated.add(x.name); } });
   };
-  walk.simple(fn as any, {
-    IfStatement(n: any) {
-      if (!bounces(n.consequent)) return;
-      walk.simple(n.test as any, {
-        CallExpression(c: any) {
-          for (const a of c.arguments ?? []) addNames(a); // predicate(x) / allow.has(x) / RE.test(x)
-          if (c.callee?.type === "MemberExpression" && VALIDATOR_METHOD.test(c.callee.property?.name ?? "")) addNames(c.callee.object); // x.startsWith(B)
-        },
-      });
+  walk.simple(test as any, {
+    CallExpression(c: any) {
+      for (const a of c.arguments ?? []) addNames(a); // predicate(x) / allow.has(x) / RE.test(x)
+      if (c.callee?.type === "MemberExpression" && VALIDATOR_METHOD.test(c.callee.property?.name ?? "")) addNames(c.callee.object); // x.startsWith(B)
     },
   });
   return validated;
+}
+function guardValidatedNames(fn: Node, taint: Set<string>): Set<string> {
+  const validated = new Set<string>();
+  walk.simple(fn as any, {
+    IfStatement(n: any) {
+      if (!bounces(n.consequent)) return;
+      for (const v of contentValidatedInTest(n.test, taint)) validated.add(v);
+    },
+  });
+  return validated;
+}
+/** Tainted names content-validated UNDER a negation (`if (!allow.has(x)) throw`, `if (!x.startsWith(B))
+ *  return`). This is the allowlist/origin-check polarity — the guard REJECTS when the check fails, so the
+ *  value that survives is known-good. A positive membership that bounces (`if (bad.includes(x)) throw`) is
+ *  a blocklist, not an allowlist, and must NOT be cleared this way. */
+function negatedContentValidated(test: Node, taint: Set<string>): Set<string> {
+  const out = new Set<string>();
+  walk.simple(test as any, {
+    UnaryExpression(u: any) {
+      if (u.operator === "!") for (const v of contentValidatedInTest(u.argument, taint)) out.add(v);
+    },
+  });
+  return out;
 }
 
 /** Taint propagation WITHOUT guard-clearing — the raw reachable set. */
@@ -229,7 +255,16 @@ function ssrfGuardSets(fn: Node, sources: string[], idx: Map<string, IndexedFn[]
     IfStatement(n: any) {
       if (!bounces(n.consequent)) return;
       const cov = ssrfGuardCoverage(guardTokens(n.test, idx));
-      if (cov === "none") return;
+      if (cov === "none") {
+        // Not a loopback/private blocklist. A NEGATED content check (`if (!host in ALLOW) throw`,
+        // `if (!url.startsWith(base)) return`) is an allowlist / origin check — the correct SSRF defense —
+        // so it clears the whole derivation component (the guard sits on `new URL(url).hostname` while
+        // `url` is fetched). Polarity matters: a positive membership that bounces (`if (bad.includes(host))
+        // throw`) is a blocklist whose coverage we simply couldn't read (e.g. the list is a separate var),
+        // so it is left tainted, not cleared.
+        for (const v of negatedContentValidated(n.test, raw)) safeRoots.add(find(v));
+        return;
+      }
       for (const v of taintedIdsIn(n.test)) (cov === "complete" ? safeRoots : weakRoots).add(find(v));
     },
   });
@@ -298,6 +333,10 @@ const CP_BARE = /^(exec|execSync|execFile|execFileSync|spawn|spawnSync|execa|exe
 const CP_OBJ = /(^|\.)(cp|childProcess|child_process|execa|shell|shelljs|sh|zx)$/i;
 const FS_METHOD = /^(readFile|readFileSync|writeFile|writeFileSync|appendFile|appendFileSync|createReadStream|createWriteStream|open|openSync|readdir|readdirSync|unlink|unlinkSync|rm|rmSync|stat|statSync|realpath|readlink|copyFile|copyFileSync)$/;
 const FS_OBJ = /(^|\.)(fs|fsp|fsPromises|promises)$/i;
+// Distinctive fs names used as a BARE call via a named import (`import { readFileSync } from "node:fs"`).
+// Restricted to the unambiguous ones (Sync variants, create*Stream, readFile/writeFile/appendFile) so a
+// bare generic `open`/`stat`/`rm` is NOT mistaken for fs. Mirrors CP_BARE for child_process.
+const FS_BARE = /^(readFile|readFileSync|writeFile|writeFileSync|appendFile|appendFileSync|createReadStream|createWriteStream|readdirSync|unlinkSync|rmSync|realpathSync|copyFileSync)$/;
 const NET_OBJ = /(^|\.)(axios|got|http|https|needle|superagent|undici|ky)$/i;
 const NET_METHOD = /^(get|post|put|patch|delete|request|fetch|head)$/;
 const SQL_METHOD = /^(query|execute|unsafe|raw)$/;
@@ -319,7 +358,7 @@ function isEvilRegexLiteral(n: Node | undefined): boolean {
 }
 /** A function that defends against prototype pollution anywhere (so merge/set sinks in it are suppressed):
  *  a `__proto__`/`constructor`/`prototype` key check, a null-prototype object, a Map, or hasOwnProperty. */
-function hasProtoGuard(fn: Node): boolean {
+function hasProtoGuard(fn: Node, idx?: Map<string, IndexedFn[]>, depth = 0): boolean {
   let g = false;
   walk.simple(fn as any, {
     Literal(x: any) { if (typeof x.value === "string" && /^(__proto__|constructor|prototype)$/.test(x.value)) g = true; },
@@ -327,6 +366,17 @@ function hasProtoGuard(fn: Node): boolean {
     NewExpression(x: any) { if ((x.callee?.name ?? memberName(x.callee)) === "Map") g = true; },
     CallExpression(x: any) { if (memberName(x.callee) === "Object.create" && x.arguments?.[0]?.type === "Literal" && x.arguments[0].value === null) g = true; },
   });
+  // The merge/set sink is often a user-defined helper (`merge`, `deepMerge`) that carries its OWN
+  // `__proto__`/`constructor` key guard; descend one hop into resolvable calls so a guard in the
+  // helper body suppresses the sink, matching how guardTokens resolves SSRF predicates.
+  if (!g && idx && depth < 1) {
+    walk.simple(fn as any, {
+      CallExpression(c: any) {
+        const r = resolveCall(c.callee, idx);
+        if (r && hasProtoGuard(r.fn.body, idx, depth + 1)) g = true;
+      },
+    });
+  }
   return g;
 }
 
@@ -425,7 +475,7 @@ function analyzeFn(fn: Node, seed: string[], file: string, ctx: Ctx, depth: numb
   const ssrfTaint = new Set<string>([...taint].filter((n) => !ssrfSafe.has(n)));
   for (const w of ssrfWeak) ssrfTaint.add(w);
   const sqlBuilt = strBuiltFromTaint(fn, taint);
-  const protoGuarded = hasProtoGuard(fn); // a __proto__/constructor key guard anywhere suppresses merge sinks
+  const protoGuarded = hasProtoGuard(fn, ctx.idx); // a __proto__/constructor key guard (here or in a resolved merge helper) suppresses merge sinks
   const pathOnly = new Set<string>(seedPathOnly);
   for (const n of urlPathOnlyNames(fn, taint)) pathOnly.add(n);
   const where = ctx.label + (via ? ` (via ${via})` : "");
@@ -482,7 +532,7 @@ function analyzeFn(fn: Node, seed: string[], file: string, ctx: Ctx, depth: numb
         emit("code-exec", "CWE-94", "HIGH", "Tool input reaches a code-execution sink",
           `Attacker-influenced MCP input flows into \`${full || bare}(...)\` — arbitrary code execution in the server process.`, n.loc?.start.line);
 
-      const isFs = FS_METHOD.test(prop) && FS_OBJ.test(obj);
+      const isFs = (FS_METHOD.test(prop) && FS_OBJ.test(obj)) || FS_BARE.test(bare);
       if (isFs && args[0] && !stripsTraversal(args[0]) && tainted(args[0]))
         emit("path-traversal", "CWE-22", "HIGH", "Tool input reaches a filesystem path sink",
           `Attacker-influenced MCP input is used as the path in \`${full}(...)\` with no traversal guard — a crafted \`../\` reads/writes arbitrary files. Resolve against a fixed root and reject paths that escape it.`, n.loc?.start.line);
@@ -547,9 +597,12 @@ function analyzeFn(fn: Node, seed: string[], file: string, ctx: Ctx, depth: numb
           `Attacker-influenced MCP input is interpolated into a shell template \`${tag}\`...\`\` — a malicious tool call can inject OS commands.`, n.loc?.start.line);
     },
     NewExpression(n: any) {
-      if (/(^|\.)Script$/.test(memberName(n.callee)) && (n.arguments ?? []).some((a: Node) => a && refsTaint(a, taint)))
+      // `new vm.Script(code)` and `new Function(body)` (+ Generator/AsyncFunction) build executable
+      // code from a string — a code-exec sink like eval().
+      const newName = n.callee?.name ?? memberName(n.callee);
+      if (/(^|\.)(Script|Function|GeneratorFunction|AsyncFunction)$/.test(newName) && (n.arguments ?? []).some((a: Node) => a && refsTaint(a, taint)))
         emit("code-exec", "CWE-94", "HIGH", "Tool input reaches a code-execution sink",
-          `Attacker-influenced MCP input flows into \`new vm.Script(...)\` — arbitrary code execution.`, n.loc?.start.line);
+          `Attacker-influenced MCP input flows into \`new ${newName}(...)\` — arbitrary code execution.`, n.loc?.start.line);
       // ReDoS: new RegExp(taintedPattern) — attacker controls the compiled regex.
       if (/(^|\.)RegExp$/.test(memberName(n.callee)) && tainted((n.arguments ?? [])[0]))
         emit("redos", "CWE-1333", "HIGH", "Tool input is compiled into a regular expression",
