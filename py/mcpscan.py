@@ -34,9 +34,10 @@ SKIP_DIRS = {"node_modules", ".git", "venv", ".venv", "__pycache__", "build", "d
              # test/spec trees: fixtures/seams are not a running server's attack surface (they dominated
              # the sweep's FP funnel). Mirrors the TS CLI walker's skip set.
              "test", "tests", "__tests__", "spec", "specs", "e2e",
-             # example / demo / docs / fixture trees: shipped to read, never a running handler surface.
+             # example / demo / docs / fixture / scripts trees: shipped to read or hand-run, never a
+             # running handler surface (a 10-repo triage showed scripts/ was pure non-handler tooling).
              "example", "examples", "demo", "demos", "sample", "samples", "docs", "doc",
-             "fixture", "fixtures", "benchmark", "benchmarks", "bench"}
+             "fixture", "fixtures", "benchmark", "benchmarks", "bench", "script", "scripts"}
 
 
 def _is_test_file(name):

@@ -17,11 +17,12 @@ const SKIP = new Set(["node_modules", "dist", ".git", "build", "coverage", "out"
   // test / spec trees: their fixtures and seams are not a running server's attack surface, and they
   // dominated the sweep's false-positive funnel (deliberately-unsafe fixtures, "not reachable" seams).
   "test", "tests", "__tests__", "spec", "specs", "e2e", "__mocks__",
-  // example / demo / docs / fixture trees: shipped for humans to read, never a running server's
-  // handler surface; the rest of the sweep's FP funnel came from here. `scripts` is deliberately NOT
-  // skipped as a dir (a server entrypoint can live there) — loose build scripts are caught by TOOL_FILE.
+  // example / demo / docs / fixture / scripts trees: shipped for humans to read or run by hand, never
+  // a running server's handler surface — the rest of the sweep's FP funnel came from here. `scripts`
+  // was initially kept for recall, but a 10-repo triage showed it was pure non-handler tooling
+  // (stdio↔HTTP bridges, config tests); loose build scripts outside it are still caught by TOOL_FILE.
   "example", "examples", "demo", "demos", "sample", "samples", "docs", "doc",
-  "fixture", "fixtures", "benchmark", "benchmarks", "bench"]);
+  "fixture", "fixtures", "benchmark", "benchmarks", "bench", "script", "scripts"]);
 // Suffixed test/spec dirs the exact-match SKIP set misses: e2e_tests, integration-tests, unit_tests…
 const TEST_DIR = /[-_](tests?|specs?|e2e)$/i;
 // Test/spec FILES anywhere (foo.test.ts, foo.spec.js, test_foo.py, foo_test.py, conftest.py).
