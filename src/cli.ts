@@ -16,10 +16,20 @@ const SRC_RE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|py)$/;
 const SKIP = new Set(["node_modules", "dist", ".git", "build", "coverage", "out", "venv", ".venv", "__pycache__",
   // test / spec trees: their fixtures and seams are not a running server's attack surface, and they
   // dominated the sweep's false-positive funnel (deliberately-unsafe fixtures, "not reachable" seams).
-  "test", "tests", "__tests__", "spec", "specs", "e2e", "__mocks__"]);
+  "test", "tests", "__tests__", "spec", "specs", "e2e", "__mocks__",
+  // example / demo / docs / fixture trees: shipped for humans to read, never a running server's
+  // handler surface; the rest of the sweep's FP funnel came from here. `scripts` is deliberately NOT
+  // skipped as a dir (a server entrypoint can live there) — loose build scripts are caught by TOOL_FILE.
+  "example", "examples", "demo", "demos", "sample", "samples", "docs", "doc",
+  "fixture", "fixtures", "benchmark", "benchmarks", "bench"]);
+// Suffixed test/spec dirs the exact-match SKIP set misses: e2e_tests, integration-tests, unit_tests…
+const TEST_DIR = /[-_](tests?|specs?|e2e)$/i;
 // Test/spec FILES anywhere (foo.test.ts, foo.spec.js, test_foo.py, foo_test.py, conftest.py).
 const TEST_FILE = /(\.(test|spec)\.[cm]?[jt]sx?$)|((^|[\/])(test_.*|conftest)\.py$)|(_test\.py$)/i;
-const isScannable = (p: string) => SRC_RE.test(p) && !TEST_FILE.test(p);
+// Build / config / codegen tooling files: a repo's verify-examples.mjs, *.config.ts, a bundler config.
+// Shipped tooling, not a request-handler surface — these leaked through the sweep as non-handler FPs.
+const TOOL_FILE = /(^|[\/])verify-[^\/]*\.[cm]?[jt]sx?$|\.config\.[cm]?[jt]sx?$|(^|[\/])(rollup|webpack|esbuild|vite|vitest|jest|babel|gulpfile|gruntfile)\.[^\/]*$/i;
+const isScannable = (p: string) => SRC_RE.test(p) && !TEST_FILE.test(p) && !TOOL_FILE.test(p);
 const RANK: Record<Severity, number> = { HIGH: 3, MEDIUM: 2, LOW: 1 };
 
 // Python MCP/AI servers are analyzed by the sibling ast-based script (py/mcpscan.py); the target
@@ -54,7 +64,7 @@ function walkFiles(root: string, acc: string[] = []): string[] {
   if (st.isFile()) { if (isScannable(root)) acc.push(root); return acc; } // explicit file arg: still skip test files
   if (!st.isDirectory()) return acc;
   for (const e of fs.readdirSync(root, { withFileTypes: true })) {
-    if (e.isDirectory()) { if (!SKIP.has(e.name)) walkFiles(path.join(root, e.name), acc); }
+    if (e.isDirectory()) { if (!SKIP.has(e.name) && !TEST_DIR.test(e.name)) walkFiles(path.join(root, e.name), acc); }
     else if (isScannable(e.name)) acc.push(path.join(root, e.name));
   }
   return acc;
@@ -81,8 +91,21 @@ function main(): void {
   }
   findings.push(...scanProject(jsFiles));
   if (hasMcpPy) findings.push(...scanPythonProject(path.resolve(target))); // one project pass over the Python tree
-  const scanned = new Set(findings.map((x) => x.file)).size;
-  const kept = findings.filter((x) => RANK[x.severity] >= RANK[min]).sort((a, b) => RANK[b.severity] - RANK[a.severity]);
+  // De-duplicate: the same sink can be reached by more than one taint path and get emitted twice. A
+  // finding is identified by where it fires and what it says (file:line:id:title:detail) — identical
+  // tuples are the same bug reported twice, so keep the first and drop the rest.
+  const seen = new Set<string>();
+  const deduped = findings.filter((f) => {
+    // One physical sink of one class = one finding. The same location is often reached by several
+    // taint paths / handler entry points, each emitting a copy that differs only in its handler label;
+    // to a reader those are the same bug, so key on file:line:id and keep the first.
+    const key = `${f.file}\u0000${f.line ?? ""}\u0000${f.id}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const scanned = new Set(deduped.map((x) => x.file)).size;
+  const kept = deduped.filter((x) => RANK[x.severity] >= RANK[min]).sort((a, b) => RANK[b.severity] - RANK[a.severity]);
 
   if (json) { console.log(JSON.stringify(kept, null, 2)); return; }
   console.log(`scanned ${files.length} source file(s); ${scanned} MCP file(s) with findings.`);

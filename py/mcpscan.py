@@ -33,12 +33,22 @@ SKIP_PARAMS = {"self", "cls", "ctx", "context"}
 SKIP_DIRS = {"node_modules", ".git", "venv", ".venv", "__pycache__", "build", "dist", ".tox", "site-packages",
              # test/spec trees: fixtures/seams are not a running server's attack surface (they dominated
              # the sweep's FP funnel). Mirrors the TS CLI walker's skip set.
-             "test", "tests", "__tests__", "spec", "specs", "e2e"}
+             "test", "tests", "__tests__", "spec", "specs", "e2e",
+             # example / demo / docs / fixture trees: shipped to read, never a running handler surface.
+             "example", "examples", "demo", "demos", "sample", "samples", "docs", "doc",
+             "fixture", "fixtures", "benchmark", "benchmarks", "bench"}
 
 
 def _is_test_file(name):
     """A pytest/unittest file (test_*.py, *_test.py, conftest.py) — not server attack surface."""
     return name == "conftest.py" or name.startswith("test_") or name.endswith("_test.py")
+
+
+_TEST_DIR = re.compile(r"[-_](tests?|specs?|e2e)$", re.I)  # e2e_tests, integration-tests, unit_tests…
+
+
+def _is_skip_dir(name):
+    return name in SKIP_DIRS or bool(_TEST_DIR.search(name))
 MAX_DEPTH = 4
 
 
@@ -704,7 +714,7 @@ def collect_files(path):
         return [path] if path.endswith(".py") else []
     out = []
     for root, dirs, files in os.walk(path):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        dirs[:] = [d for d in dirs if not _is_skip_dir(d)]
         for f in files:
             if f.endswith(".py") and not _is_test_file(f):
                 out.append(os.path.join(root, f))
